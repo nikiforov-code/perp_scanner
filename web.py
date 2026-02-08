@@ -1,0 +1,1904 @@
+from fastapi import FastAPI, Request, Query
+from fastapi.responses import HTMLResponse, JSONResponse
+from datetime import datetime, timezone, timedelta
+import asyncio
+import time
+import httpx
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+app = FastAPI(title="Funding Spread Scanner")
+
+# =========================
+# НАСТРОЙКИ (тут ты меняешь параметры, не трогая код ниже)
+# =========================
+MSK = timezone(timedelta(hours=3))
+
+REFRESH_SECONDS = 30  # обновление данных (как ты решил)
+
+NEAR_HOURS = 2
+NEAR_MAX_MINUTES = NEAR_HOURS * 60
+
+# =========================
+# ADMIN (для будущей админки UI)
+# =========================
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "").strip()
+
+def is_admin(request: Request) -> bool:
+    """
+    Admin auth for /admin and /api/admin/*
+    Accepts token via:
+      - header: X-Admin-Token
+      - query:  ?token=...
+    """
+    if not ADMIN_TOKEN:
+        return False
+
+    token_h = (request.headers.get("X-Admin-Token") or "").strip()
+    token_q = (request.query_params.get("token") or "").strip()
+    token = token_h or token_q
+    return token == ADMIN_TOKEN
+
+
+# OKX (добавляем аккуратно, чтобы было стабильно)
+ENABLE_OKX = True
+OKX_MAX_SYMBOLS_PER_REFRESH = 350  # лимит, чтобы не упереться в ограничения OKX
+
+# Gate.io
+ENABLE_GATE = True
+
+# Bitget
+ENABLE_BITGET = True
+
+# BingX
+ENABLE_BINGX = True
+
+# KuCoin
+ENABLE_KUCOIN = True
+
+# =========================
+# UI SETTINGS (SQLite) — для админки UI-фильтров (НЕ влияет на bot endpoints)
+# =========================
+
+UI_DB_PATH = os.getenv("UI_DB_PATH", "ui_settings.db")
+
+UI_DEFAULTS = {
+    "min_vol_usdt": 5_000_000,          # дефолт (потом будешь менять через админку)
+    "min_spread_timing_yes": 0.2,       # дефолт для Timing=YES
+    "min_spread_timing_no": 0.35,       # дефолт для Timing=NO
+    "min_price_spread_neg": 0.0,        # фильтр Price Δ%: показывать только если <= -этого значения
+}
+
+# Текущие значения в памяти (загружаются из SQLite при ui_db_init)
+UI_SETTINGS = dict(UI_DEFAULTS)
+
+
+def ui_db_init() -> None:
+    """
+    Создаёт таблицу ui_settings и подтягивает настройки в UI_SETTINGS.
+    Если каких-то ключей нет — создаёт их с дефолтами.
+    """
+    import sqlite3
+
+    con = sqlite3.connect(UI_DB_PATH, timeout=5)
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA busy_timeout=3000;")
+        con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ui_settings (
+                k TEXT PRIMARY KEY,
+                v REAL
+            )
+            """
+        )
+
+        # гарантируем наличие дефолтов в БД
+        for k, v in UI_DEFAULTS.items():
+            con.execute(
+                "INSERT OR IGNORE INTO ui_settings(k, v) VALUES(?, ?)",
+                (k, float(v)),
+            )
+
+        con.commit()
+
+        # грузим в память
+        cur = con.execute("SELECT k, v FROM ui_settings")
+        rows = cur.fetchall()
+        for k, v in rows:
+            if k:
+                UI_SETTINGS[k] = float(v)
+
+    finally:
+        con.close()
+
+
+def ui_get(key: str, default=None):
+    """
+    Чтение из памяти (UI_SETTINGS). SQLite читаем один раз на старте (ui_db_init),
+    дальше работаем из памяти.
+    """
+    return UI_SETTINGS.get(key, default)
+
+
+def ui_set(key: str, value: float) -> None:
+    """
+    Запись в SQLite + обновление памяти.
+    """
+    import sqlite3
+
+    key = (key or "").strip()
+    if not key:
+        return
+
+    con = sqlite3.connect(UI_DB_PATH, timeout=5)
+    try:
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA busy_timeout=3000;")
+        con.execute(
+            "INSERT INTO ui_settings(k, v) VALUES(?, ?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+            (key, float(value)),
+        )
+        con.commit()
+        UI_SETTINGS[key] = float(value)
+    finally:
+        con.close()
+
+STATE = {
+    "rows": [],
+    "per_exchange": {},
+    "updated_ts": 0.0,
+    "error": None,
+    "sources": {},
+    "ex_status": {},  # <-- новое: статусы обновления по биржам
+}
+
+def msk_hhmm(ms: int) -> str:
+    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(MSK)
+    return dt.strftime("%H:%M")
+
+def minutes_until(ms: int) -> int:
+    now = int(time.time() * 1000)
+    return max(0, int((ms - now) / 60000))
+
+def to_percent(rate_str: str) -> float:
+    # rate_str обычно в долях (пример 0.0001). Переводим в %
+    return float(rate_str) * 100.0
+
+def to_int_ms(v) -> int:
+    try:
+        if v is None:
+            return 0
+        s = str(v).strip()
+        if not s:
+            return 0
+        return int(float(s))
+    except Exception:
+        return 0
+
+
+def make_binance_link(symbol: str) -> str:
+    return f"https://www.binance.com/en/futures/{symbol}"
+
+def make_bybit_link(symbol: str) -> str:
+    return f"https://www.bybit.com/trade/usdt/{symbol}"
+
+def make_okx_link(inst_id: str) -> str:
+    # OKX использует формат типа BTC-USDT-SWAP
+    return f"https://www.okx.com/trade-swap/{inst_id}"
+
+def make_gate_link(contract: str) -> str:
+    # пример: BTC_USDT -> страница фьючерса Gate
+    return f"https://www.gate.com/futures/USDT/{contract}"
+
+def make_bitget_link(symbol: str) -> str:
+    return f"https://www.bitget.com/futures/usdt/{symbol}"
+
+def make_bingx_link(symbol: str) -> str:
+    # BTCUSDT -> https://bingx.com/en/perpetual/BTC-USDT
+    if symbol.endswith("USDT"):
+        coin = symbol[:-4]
+        return f"https://bingx.com/en/perpetual/{coin}-USDT"
+    return "https://bingx.com"
+
+def make_kucoin_link(symbol: str) -> str:
+    # В KuCoin Futures контракт обычно имеет суффикс M: BTCUSDT -> BTCUSDTM
+    if symbol.endswith("USDT"):
+        return f"https://www.kucoin.com/futures/trade/{symbol}M"
+    return "https://www.kucoin.com/futures"
+
+def get_mode_from_request(request: Request) -> str:
+    mode = request.query_params.get("mode", "").strip().lower()
+    if mode in ("all", "near"):
+        return mode
+    return "near"
+
+def okx_instid_to_symbol(inst_id: str) -> str:
+    # BTC-USDT-SWAP -> BTCUSDT
+    parts = inst_id.split("-")
+    if len(parts) >= 2 and parts[1] == "USDT":
+        return f"{parts[0]}USDT"
+    return ""
+
+async def fetch_binance(client: httpx.AsyncClient) -> dict:
+    """
+    Binance USD-M Futures:
+    1) exchangeInfo -> whitelist реально торгуемых PERPETUAL (status=TRADING)
+    2) premiumIndex -> funding + nextFundingTime
+    """
+    base = "https://fapi.binance.com"
+
+    # 1) whitelist TRADING символов
+    info_url = f"{base}/fapi/v1/exchangeInfo"
+    r1 = await client.get(info_url, timeout=10)
+    r1.raise_for_status()
+    info = r1.json()
+
+    tradable = set()
+    for s in (info.get("symbols") or []):
+        sym = s.get("symbol")
+        if not sym or not sym.endswith("USDT"):
+            continue
+        if s.get("contractType") != "PERPETUAL":
+            continue
+        if s.get("status") != "TRADING":
+            continue
+        tradable.add(sym)
+
+    # 2) funding из premiumIndex
+    prem_url = f"{base}/fapi/v1/premiumIndex"
+    r2 = await client.get(prem_url, timeout=10)
+    r2.raise_for_status()
+    data = r2.json()
+
+    # 3) 24h объёмы (quoteVolume) — для USDT-пар это объём в USDT
+    vol_url = f"{base}/fapi/v1/ticker/24hr"
+    r3 = await client.get(vol_url, timeout=10)
+    r3.raise_for_status()
+    vol_data = r3.json()
+
+    vol_map = {}
+    for v in vol_data:
+        sym = v.get("symbol")
+        if not sym or sym not in tradable:
+            continue
+        qv = v.get("quoteVolume")
+        try:
+            vol_map[sym] = float(qv)
+        except Exception:
+            continue
+
+    out = {}
+    for item in data:
+        sym = item.get("symbol")
+        if not sym or sym not in tradable:
+            continue
+
+        out[sym] = {
+            "exchange": "BINANCE",
+            "funding_pct": to_percent(item["lastFundingRate"]),
+            "next_ms": int(item["nextFundingTime"]),
+            "mark_px": float(item.get("markPrice") or 0.0),            
+            "link": make_binance_link(sym),
+            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
+        }
+    return out
+
+async def fetch_bybit(client: httpx.AsyncClient) -> dict:
+    """
+    Bybit V5: GET /v5/market/tickers?category=linear
+    поля: fundingRate, nextFundingTime, turnover24h
+    """
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear"}
+
+    r = await client.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    items = (js.get("result", {}) or {}).get("list", []) or []
+
+    # Составляем карту объёмов из ТОГО ЖЕ ответа (turnover24h)
+    vol_map = {}
+    for it in items:
+        sym = (it.get("symbol") or "").strip()
+        if not sym:
+            continue
+        t24 = it.get("turnover24h")
+        if t24 is None:
+            continue
+        try:
+            vol_map[sym] = float(t24)
+        except Exception:
+            continue
+
+    out = {}
+    for item in items:
+        sym = (item.get("symbol") or "").strip()
+        if not sym or not sym.endswith("USDT"):
+            continue
+
+        fr = item.get("fundingRate")
+        nft = item.get("nextFundingTime")
+
+        if fr is None or nft is None:
+            continue
+
+        out[sym] = {
+            "exchange": "BYBIT",
+            "funding_pct": to_percent(fr),
+            "next_ms": int(nft),
+            "mark_px": float(item.get("markPrice") or 0.0),
+            "link": make_bybit_link(sym),
+            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
+        }
+
+    return out
+
+async def fetch_okx(client: httpx.AsyncClient) -> dict:
+    """
+    OKX:
+    1) берём список SWAP инструментов: GET /api/v5/public/instruments?instType=SWAP
+    2) по каждому instId берём funding: GET /api/v5/public/funding-rate?instId=...
+    """
+    # 1) список инструментов
+    inst_url = "https://www.okx.com/api/v5/public/instruments"
+    r = await client.get(inst_url, params={"instType": "SWAP"}, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+    data = js.get("data", []) or []
+
+    inst_ids = []
+    for it in data:
+        inst_id = it.get("instId", "")
+        # берём только USDT-SWAP
+        if inst_id.endswith("-USDT-SWAP"):
+            inst_ids.append(inst_id)
+
+    # лимитируем, чтобы было стабильно
+    inst_ids = inst_ids[:OKX_MAX_SYMBOLS_PER_REFRESH]
+    # --- OKX 24h volumes (SWAP, USDT) ---
+    vol_map = {}
+
+    tick_url = "https://www.okx.com/api/v5/market/tickers"
+    r_tick = await client.get(tick_url, params={"instType": "SWAP"}, timeout=10)
+    r_tick.raise_for_status()
+    tick_js = r_tick.json()
+
+    for t in (tick_js.get("data") or []):
+        inst_id = t.get("instId", "")
+        if not inst_id.endswith("-USDT-SWAP"):
+            continue
+
+        sym = okx_instid_to_symbol(inst_id)
+        if not sym:
+            continue
+
+        v = t.get("volCcy24h")
+        px = t.get("last")
+        try:
+            vol_map[sym] = float(v) * float(px)
+        except Exception:
+            continue
+    # --- OKX mark prices (SWAP) ---
+    mark_map = {}
+    try:
+        mp_url = "https://www.okx.com/api/v5/public/mark-price"
+        r_mp = await client.get(mp_url, params={"instType": "SWAP"}, timeout=10)
+        r_mp.raise_for_status()
+        mp_js = r_mp.json()
+
+        for t in (mp_js.get("data") or []):
+            inst_id = t.get("instId", "")
+            if not inst_id.endswith("-USDT-SWAP"):
+                continue
+
+            sym = okx_instid_to_symbol(inst_id)
+            if not sym:
+                continue
+
+            mp = t.get("markPx")
+            if mp is None:
+                continue
+
+            try:
+                mark_map[sym] = float(mp)
+            except Exception:
+                continue
+    except Exception:
+        mark_map = {}
+    out = {}
+
+    async def one(inst_id: str):
+        url = "https://www.okx.com/api/v5/public/funding-rate"
+        rr = await client.get(url, params={"instId": inst_id}, timeout=10)
+        rr.raise_for_status()
+        jj = rr.json()
+        d = (jj.get("data", []) or [])
+        if not d:
+            return
+        rec = d[0]
+        funding_rate = rec.get("fundingRate")
+        next_ft = rec.get("nextFundingTime")  # обычно есть
+        ft = rec.get("fundingTime")           # на всякий случай
+
+        if funding_rate is None:
+            return
+
+        ft_ms = to_int_ms(ft)
+        next_ft_ms = to_int_ms(next_ft)
+
+        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
+        cands = [t for t in (ft_ms, next_ft_ms) if t and t >= now_ms]
+        next_ms = min(cands) if cands else (next_ft_ms or ft_ms)
+
+
+        sym = okx_instid_to_symbol(inst_id)
+        if not sym:
+            return
+
+        out[sym] = {
+            "exchange": "OKX",
+            "funding_pct": to_percent(funding_rate),
+            "next_ms": next_ms,
+            "link": make_okx_link(inst_id),
+
+            "okx_fundingTime_ms": ft_ms,
+            "okx_nextFundingTime_ms": next_ft_ms,
+
+            "mark_px": float(mark_map.get(sym, 0.0)),
+            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
+        }
+
+    # параллельно, но аккуратно (batch)
+    sem = asyncio.Semaphore(12)
+    async def guarded(inst_id: str):
+        async with sem:
+            await one(inst_id)
+
+    await asyncio.gather(*(guarded(i) for i in inst_ids))
+    return out
+
+GATE_ACTIVE_CONTRACTS_TTL = 3 * 60 * 60  # 3 часа
+_gate_active_contracts_cache = {
+    "ts": 0,
+    "symbols": set(),
+}
+async def get_gate_active_contracts(client: httpx.AsyncClient) -> set[str]:
+    now = time.time()
+    if now - _gate_active_contracts_cache["ts"] < GATE_ACTIVE_CONTRACTS_TTL:
+        return _gate_active_contracts_cache["symbols"]
+
+    url = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
+    r = await client.get(url)
+    r.raise_for_status()
+    data = r.json()
+
+    active = set()
+    for c in data:
+        # active + perpetual + USDT
+        if (
+            c.get("in_delisting") is False
+            and c.get("name", "").endswith("_USDT")
+        ):
+            active.add(c["name"].replace("_USDT", ""))
+
+    _gate_active_contracts_cache["ts"] = now
+    _gate_active_contracts_cache["symbols"] = active
+    return active
+
+async def fetch_gate(client: httpx.AsyncClient) -> dict:
+    active_contracts = await get_gate_active_contracts(client)
+    # Gate.io Futures (USDT settle):
+    # GET /api/v4/futures/usdt/contracts
+    # поля: funding_rate (string, доля), funding_next_apply (unix seconds)
+    url = "https://fx-api.gateio.ws/api/v4/futures/usdt/contracts"
+    r = await client.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    # 24h объёмы Gate берём из /futures/usdt/tickers
+    tick_url = "https://fx-api.gateio.ws/api/v4/futures/usdt/tickers"
+    r_tick = await client.get(tick_url, timeout=10)
+    r_tick.raise_for_status()
+    tickers = r_tick.json()
+
+    vol_map = {}
+    mark_map = {}
+    for t in tickers:
+        name = t.get("contract")  # пример: BTC_USDT
+        if not name or not name.endswith("_USDT"):
+            continue
+
+        coin = name.replace("_USDT", "")
+        sym = f"{coin}USDT"
+        # --- mark price для Price Δ% ---
+        mp = t.get("mark_price")
+        if mp is None:
+            mp = t.get("markPrice")
+        if mp is None:
+            mp = t.get("mark")
+        if mp is None:
+            mp = t.get("last")  # fallback, если mark нет (лучше чем ничего)
+
+        if mp is not None:
+            try:
+                mark_map[sym] = float(mp)
+            except Exception:
+                pass
+        qv = t.get("volume_24h_quote")
+        if qv is None:
+            continue
+        try:
+            vol_map[sym] = float(qv)
+        except Exception:
+            continue  
+
+    out = {}
+    for item in data:
+        name = item.get("name")  # пример: BTC_USDT
+        if not name or not name.endswith("_USDT"):
+            continue
+
+        fr = item.get("funding_rate")
+        nft = item.get("funding_next_apply")  # unix seconds
+        if fr is None or nft is None:
+            continue
+
+        coin = name.replace("_USDT", "")
+
+        if coin not in active_contracts:
+            continue
+
+        sym = f"{coin}USDT"
+
+        out[sym] = {
+            "exchange": "GATE",
+            "funding_pct": to_percent(fr),
+            "next_ms": int(nft) * 1000,
+            "link": make_gate_link(name),
+            "mark_px": float(mark_map.get(sym, 0.0)),
+            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
+        }
+
+    return out
+
+# --- BITGET contracts cache ---
+_BITGET_CONTRACTS_CACHE = {"ts": 0.0, "set": set()}
+_BITGET_CONTRACTS_TTL_SEC = 3 * 60 * 60  # 3 часа
+
+async def _get_bitget_usdt_active_symbols(client: httpx.AsyncClient) -> set:
+    now = time.time()
+    if _BITGET_CONTRACTS_CACHE["set"] and (now - _BITGET_CONTRACTS_CACHE["ts"] < _BITGET_CONTRACTS_TTL_SEC):
+        return _BITGET_CONTRACTS_CACHE["set"]
+
+    # Список контрактов (активных) Bitget USDT-M
+    url = "https://api.bitget.com/api/v2/mix/market/contracts"
+    r = await client.get(url, params={"productType": "usdt-futures"}, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data") or []
+    active = set()
+
+    for it in data:
+        # В разных ответах Bitget бывает:
+        # - symbol: "BTCUSDT"
+        # - symbol: "BTCUSDT_UMCBL"
+        # - baseCoin/quoteCoin
+        sym = (it.get("symbol") or "").strip()
+        if not sym:
+            continue
+
+        # нормализуем к BTCUSDT (без _UMCBL)
+        sym_norm = sym.split("_", 1)[0].upper()
+
+        if not sym_norm.endswith("USDT"):
+            continue
+
+        # если есть явный статус — берём только активные
+        status = it.get("status")
+        if status is not None:
+            # у Bitget встречаются разные значения, но активные обычно "normal"/"online"/"1"
+            s = str(status).lower()
+            if s in ("offline", "delisted", "0", "false"):
+                continue
+
+        active.add(sym_norm)
+
+    _BITGET_CONTRACTS_CACHE["ts"] = now
+    _BITGET_CONTRACTS_CACHE["set"] = active
+    return active
+
+async def fetch_bitget(client: httpx.AsyncClient) -> dict:
+    """
+    Bitget USDT-M funding:
+    1) contracts whitelist (активные)
+    2) current-fund-rate -> фильтруем только активные
+    """
+    active = await _get_bitget_usdt_active_symbols(client)
+
+    # --- BITGET 24h volumes (USDT) ---
+    vol_map = {}
+    mark_map = {}
+    try:
+        tick_url = "https://api.bitget.com/api/v2/mix/market/tickers"
+        r_tick = await client.get(tick_url, params={"productType": "USDT-FUTURES"}, timeout=10)
+        r_tick.raise_for_status()
+        tick_js = r_tick.json()
+
+        for t in (tick_js.get("data") or []):
+            raw = (t.get("symbol") or "").strip()
+            if not raw:
+                continue
+            sym_norm = raw.split("_", 1)[0].upper()
+            if not sym_norm.endswith("USDT"):
+                continue
+
+            # в документации есть quoteVolume и usdtVolume; для USDT-M логичнее usdtVolume
+            v = t.get("usdtVolume") or t.get("quoteVolume")
+            if v is None:
+                continue
+            try:
+                vol_map[sym_norm] = float(v)
+            except Exception:
+                continue
+
+            px = t.get("markPrice") or t.get("markPx") or t.get("lastPr") or t.get("last") or t.get("price")
+            if px is None:
+                continue
+            try:
+                mark_map[sym_norm] = float(px)
+            except Exception:
+                continue
+    except Exception:
+        # объём — не критичный, не ломаем биржу если тикеры временно недоступны
+        vol_map = {}
+        mark_map = {}
+
+    url = "https://api.bitget.com/api/v2/mix/market/current-fund-rate"
+    r = await client.get(url, params={"productType": "usdt-futures"}, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data", []) or []
+    out = {}
+
+    for item in data:
+        raw_sym = (item.get("symbol") or "").strip()
+        if not raw_sym:
+            continue
+
+        sym = raw_sym.split("_", 1)[0].upper()
+        if not sym.endswith("USDT"):
+            continue
+
+        # ключевая фильтрация: только реально активные контракты
+        if sym not in active:
+            continue
+
+        fr = item.get("fundingRate")
+        nu = item.get("nextUpdate")  # ms
+        if fr is None or nu is None:
+            continue
+
+        out[sym] = {
+            "exchange": "BITGET",
+            "funding_pct": to_percent(fr),
+            "next_ms": int(nu),
+            "link": make_bitget_link(sym),
+            "mark_px": float(mark_map.get(sym, 0.0)),
+            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
+        }
+
+    return out
+
+# --- BINGX contracts cache ---
+_BINGX_CONTRACTS_CACHE = {"ts": 0.0, "set": set()}
+_BINGX_CONTRACTS_TTL_SEC = 3 * 60 * 60  # 3 часа
+
+async def _get_bingx_usdt_active_symbols(client: httpx.AsyncClient) -> set:
+    now = time.time()
+    if _BINGX_CONTRACTS_CACHE["set"] and (now - _BINGX_CONTRACTS_CACHE["ts"] < _BINGX_CONTRACTS_TTL_SEC):
+        return _BINGX_CONTRACTS_CACHE["set"]
+
+    # Список контрактов BingX Swap (USDT Perpetual)
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/contracts"
+    r = await client.get(url, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    data = js.get("data")
+    if isinstance(data, dict):
+        data = data.get("list")
+
+    if not isinstance(data, list):
+        # если API неожиданно поменялся — не режем всё, просто вернём пустой set
+        _BINGX_CONTRACTS_CACHE["ts"] = now
+        _BINGX_CONTRACTS_CACHE["set"] = set()
+        return set()
+
+    active = set()
+    for it in data:
+        sym = (it.get("symbol") or it.get("s") or "").strip()
+        if not sym:
+            continue
+
+        # обычно "BTC-USDT" -> BTCUSDT
+        sym_norm = sym.replace("-", "").upper()
+        if not sym_norm.endswith("USDT"):
+            continue
+
+        # если есть статус/флаг — оставляем только активные (мягко)
+        status = it.get("status") or it.get("st")
+        if status is not None:
+            s = str(status).lower()
+            if s in ("0", "false", "offline", "delisted", "suspend", "closed"):
+                continue
+
+        active.add(sym_norm)
+
+    _BINGX_CONTRACTS_CACHE["ts"] = now
+    _BINGX_CONTRACTS_CACHE["set"] = active
+    return active
+
+async def fetch_bingx(client: httpx.AsyncClient) -> dict:
+    """
+    BingX Swap V2 (public):
+    GET https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex
+    Обычно возвращает список по всем контрактам с funding и временем следующего funding.
+    """
+    active = await _get_bingx_usdt_active_symbols(client)
+
+    # --- BINGX 24h volumes (USDT turnover) ---
+    vol_map = {}
+    mark_map = {}
+    try:
+        tick_url = "https://open-api.bingx.com/openApi/swap/v2/quote/ticker"
+        r_tick = await client.get(tick_url, timeout=10)
+        r_tick.raise_for_status()
+        tick_js = r_tick.json()
+
+        tdata = tick_js.get("data")
+        if isinstance(tdata, dict):
+            tdata = tdata.get("list")
+        if not isinstance(tdata, list):
+            tdata = []
+
+        for t in tdata:
+            raw = (t.get("symbol") or t.get("s") or "").strip()
+            if not raw:
+                continue
+
+            # "BTC-USDT" -> "BTCUSDT"
+            sym_norm = raw.replace("-", "").upper()
+            if not sym_norm.endswith("USDT"):
+                continue
+
+            # у BingX turnover в USDT обычно в поле quoteVolume
+            qv = t.get("quoteVolume") or t.get("quote_volume") or t.get("q")
+            if qv is None:
+                continue
+
+            try:
+                vol_map[sym_norm] = float(qv)
+            except Exception:
+                continue
+            px = (
+                t.get("markPrice")
+                or t.get("mark_price")
+                or t.get("lastPrice")
+                or t.get("last")
+                or t.get("close")
+                or t.get("c")
+            )
+            if px is not None:
+                try:
+                    mark_map[sym_norm] = float(px)
+                except Exception:
+                    pass
+    except Exception:
+        vol_map = {}
+        mark_map = {}
+
+    url = "https://open-api.bingx.com/openApi/swap/v2/quote/premiumIndex"
+    r = await client.get(url, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    # В разных версиях/обёртках может быть data как list или dict с list
+    data = js.get("data")
+    if isinstance(data, dict):
+        # иногда бывает {"data": {"list": [...]}}
+        data = data.get("list")
+
+    if not isinstance(data, list):
+        return {}
+
+    out = {}
+    for item in data:
+        sym = item.get("symbol") or item.get("s")
+        if not sym:
+            continue
+
+        # BingX часто: "BTC-USDT" (с дефисом). Приводим к "BTCUSDT"
+        sym_norm = sym.replace("-", "").upper()
+
+        if not sym_norm.endswith("USDT"):
+            continue
+
+        if active and sym_norm not in active:
+            continue
+
+        fr = (
+            item.get("lastFundingRate")
+            or item.get("fundingRate")
+            or item.get("funding_rate")
+            or item.get("r")
+        )
+        nft = (
+            item.get("nextFundingTime")
+            or item.get("nextFundingTimestamp")
+            or item.get("nextFundingTimeStamp")
+            or item.get("next_funding_time")
+            or item.get("T")
+        )
+
+        if fr is None or nft is None:
+            continue
+
+        # next funding time: бывает ms, бывает sec — нормализуем в ms
+        try:
+            t = int(float(nft))
+            if t < 10_000_000_000:  # похоже на секунды
+                t = t * 1000
+        except Exception:
+            continue
+
+        out[sym_norm] = {
+            "exchange": "BINGX",
+            "funding_pct": to_percent(fr),
+            "next_ms": t,
+            "link": make_bingx_link(sym_norm),
+            "mark_px": float(mark_map.get(sym_norm, 0.0)),
+            "vol_usdt_24h": float(vol_map.get(sym_norm, 0.0)),
+        }
+
+    return out
+
+# --- KUCOIN contracts cache ---
+_KUCOIN_CONTRACTS_CACHE = {"ts": 0.0, "set": set()}
+_KUCOIN_CONTRACTS_TTL_SEC = 3 * 60 * 60  # 3 часа
+
+async def _get_kucoin_active_contracts(client: httpx.AsyncClient) -> set:
+    """
+    KuCoin Futures: active contracts list.
+    GET https://api-futures.kucoin.com/api/v1/contracts/active
+    Returns a set of contract symbols like {"XBTUSDTM", "ETHUSDTM", ...}
+    """
+    now = time.time()
+    if _KUCOIN_CONTRACTS_CACHE["set"] and (now - _KUCOIN_CONTRACTS_CACHE["ts"] < _KUCOIN_CONTRACTS_TTL_SEC):
+        return _KUCOIN_CONTRACTS_CACHE["set"]
+
+    url = "https://api-futures.kucoin.com/api/v1/contracts/active"
+    r = await client.get(url, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    active = set()
+    data = js.get("data") or []
+    for it in data:
+        sym = (it.get("symbol") or "").strip().upper()  # e.g. XBTUSDTM
+        if sym:
+            active.add(sym)
+
+    _KUCOIN_CONTRACTS_CACHE["ts"] = now
+    _KUCOIN_CONTRACTS_CACHE["set"] = active
+    return active
+
+async def fetch_kucoin_funding(client: httpx.AsyncClient, coins: list[str]) -> dict:
+    """
+    KuCoin Unified API (public):
+    GET https://api.kucoin.com/api/ua/v1/market/funding-rate?symbol=...
+    Важно: не даём одной плохой монете ломать весь refresh_loop.
+    """
+    out = {}
+    sem = asyncio.Semaphore(8)
+    active_contracts = await _get_kucoin_active_contracts(client)
+
+    # --- KUCOIN 24h volumes (USDT turnover) ---
+    vol_map = {}
+    mark_map = {}
+    try:
+        # KuCoin Futures: active contracts include 24h turnover
+        tick_url = "https://api-futures.kucoin.com/api/v1/contracts/active"
+        r_tick = await client.get(tick_url, timeout=10)
+        r_tick.raise_for_status()
+        tick_js = r_tick.json()
+
+        data = tick_js.get("data") or []
+        if not isinstance(data, list):
+            data = []
+
+        for t in data:
+            raw = (t.get("symbol") or "").strip().upper()  # например: XBTUSDTM
+            if not raw:
+                continue
+
+            # "XBTUSDTM" -> "XBTUSDT"
+            sym_norm = raw.replace("USDTM", "USDT")
+            if not sym_norm.endswith("USDT"):
+                continue
+
+            tv = t.get("turnoverOf24h")  # 24h turnover (USDT)
+            if tv is None:
+                continue
+
+            try:
+                vol_map[sym_norm] = float(tv)
+            except Exception:
+                continue
+            px = t.get("markPrice") or t.get("indexPrice") or t.get("lastTradePrice")
+            if px is not None:
+                try:
+                    mark_map[sym_norm] = float(px)
+                except Exception:
+                    pass
+    except Exception:
+        vol_map = {}
+
+    def is_valid_coin(coin: str) -> bool:
+        # KuCoin контракты ожидают латиницу/цифры (типа BTC, XBT, 1000PEPE и т.п.)
+        # Пропускаем любые экзотические/иероглифы/пробелы.
+        if not coin:
+            return False
+        for ch in coin:
+            if not (("A" <= ch <= "Z") or ("0" <= ch <= "9")):
+                return False
+        return True
+
+    # минимальный маппинг тикеров KuCoin (BTC -> XBT)
+    def to_kucoin_coin(coin: str) -> str:
+        if coin == "BTC":
+            return "XBT"
+        return coin
+
+    async def one(coin: str):
+        async with sem:
+            try:
+                coin = (coin or "").upper().strip()
+                if not is_valid_coin(coin):
+                    return
+
+                kc_coin = to_kucoin_coin(coin)
+                contract = f"{kc_coin}USDTM"
+
+                if contract not in active_contracts:
+                    return
+
+
+                url = "https://api.kucoin.com/api/ua/v1/market/funding-rate"
+                r = await client.get(url, params={"symbol": contract}, timeout=10)
+                r.raise_for_status()
+                js = r.json()
+
+                data = js.get("data") or {}
+                fr = data.get("nextFundingRate")
+                ft = data.get("fundingTime")  # ms
+                if fr is None or ft is None:
+                    return
+
+                sym = f"{coin}USDT"
+                out[sym] = {
+                    "exchange": "KUCOIN",
+                    "funding_pct": float(fr) * 100.0,
+                    "next_ms": int(ft),
+                    "link": make_kucoin_link(sym),
+                    "mark_px": float(mark_map.get(f"{kc_coin}USDT", 0.0)),
+                    "vol_usdt_24h": float(vol_map.get(f"{kc_coin}USDT", 0.0)),
+                }
+
+            except Exception:
+                # Любая ошибка по конкретной монете — просто пропускаем,
+                # чтобы не ломать весь refresh loop.
+                return
+
+    await asyncio.gather(*(one(c) for c in coins))
+    return out
+
+# --- MEXC contracts cache ---
+_MEXC_CONTRACTS_CACHE = {"ts": 0.0, "map": {}}
+_MEXC_CONTRACTS_TTL_SEC = 2 * 60 * 60  # 2 часа
+
+
+async def _get_mexc_usdt_symbol_map(client: httpx.AsyncClient) -> dict:
+    now = time.time()
+    if _MEXC_CONTRACTS_CACHE["map"] and (now - _MEXC_CONTRACTS_CACHE["ts"] < _MEXC_CONTRACTS_TTL_SEC):
+        return _MEXC_CONTRACTS_CACHE["map"]
+
+    url = "https://contract.mexc.com/api/v1/contract/detail"
+    r = await client.get(url, timeout=10)
+    r.raise_for_status()
+    js = r.json()
+
+    mp = {}
+    data = js.get("data") or []
+
+    for it in data:
+        sym = (it.get("symbol") or "").strip()          # "BTC_USDT", "LUNA2_USDT"
+        if not sym or "_USDT" not in sym:
+            continue
+
+        quote = (it.get("quoteCoin") or "").strip().upper()
+        if quote and quote != "USDT":
+            continue
+
+        # state у MEXC может быть разным по версиям API (0/1/2/...) — НЕ режем по нему жёстко
+        # но если есть явный флаг "offline"/"delisted", тогда можно резать — тут его нет, поэтому пропускаем.
+
+        base = (it.get("baseCoin") or "").strip().upper()
+        if not base:
+            base = sym.split("_", 1)[0].upper()
+
+        sym = sym.upper()
+
+        # записываем первую встреченную версию
+        if base and base not in mp:
+            mp[base] = sym
+
+    _MEXC_CONTRACTS_CACHE["ts"] = now
+    _MEXC_CONTRACTS_CACHE["map"] = mp
+    return mp
+
+async def fetch_mexc_funding(client: httpx.AsyncClient, symbols: list[str]) -> dict:
+    out = {}
+    sem = asyncio.Semaphore(8)
+
+    mexc_map = await _get_mexc_usdt_symbol_map(client)
+
+    # --- MEXC 24h volumes (USDT turnover) ---
+    vol_map = {}
+    mark_map = {}
+    try:
+        tick_url = "https://contract.mexc.com/api/v1/contract/ticker"
+        r_tick = await client.get(tick_url, timeout=10)
+        r_tick.raise_for_status()
+        tick_js = r_tick.json()
+
+        data = tick_js.get("data")
+        # В зависимости от режима API "data" может быть dict (если один символ) или list (если все)
+        if isinstance(data, dict):
+            data = [data]
+        if not isinstance(data, list):
+            data = []
+
+        for t in data:
+            raw = (t.get("symbol") or "").strip().upper()  # пример: "BTC_USDT"
+            if not raw or "_USDT" not in raw:
+                continue
+
+            # "BTC_USDT" -> "BTCUSDT"
+            sym_norm = raw.replace("_", "")
+
+            a24 = t.get("amount24")  # 24h turnover (USDT)
+            if a24 is None:
+                continue
+            try:
+                vol_map[sym_norm] = float(a24)
+            except Exception:
+                continue
+            px = (
+                t.get("markPrice")
+                or t.get("fairPrice")
+                or t.get("lastPrice")
+                or t.get("last")
+                or t.get("indexPrice")
+            )
+            if px is None:
+                continue
+            try:
+                mark_map[sym_norm] = float(px)
+            except Exception:
+                continue            
+    except Exception:
+        vol_map = {}
+        mark_map = {}
+
+    def resolve_mexc_symbol(coin: str) -> str | None:
+        coin = coin.upper()
+
+        if coin in mexc_map:
+            return mexc_map[coin]
+
+        # COIN2, COIN3 и т.п.
+        for d in ("2", "3", "4", "5"):
+            if coin + d in mexc_map:
+                return mexc_map[coin + d]
+
+        # любые версии вида COIN<digits>
+        for base, sym in mexc_map.items():
+            if base.startswith(coin) and base[len(coin):].isdigit():
+                return sym
+
+        return None
+
+    async def one(coin: str):
+        async with sem:
+            mexc_symbol = resolve_mexc_symbol(coin)
+            if not mexc_symbol:
+                return
+
+            url = f"https://contract.mexc.com/api/v1/contract/funding_rate/{mexc_symbol}"
+            r = await client.get(url, timeout=10)
+            r.raise_for_status()
+            j = r.json()
+
+            if not j.get("success"):
+                return
+
+            data = j.get("data") or {}
+            rate = data.get("fundingRate")
+            next_ts = data.get("nextSettleTime")
+            if rate is None or next_ts is None:
+                return
+
+            sym = f"{coin}USDT"
+            out[sym] = {
+                "exchange": "MEXC",
+                "funding_pct": to_percent(rate),
+                "next_ms": int(next_ts),
+                "link": f"https://www.mexc.com/futures/{mexc_symbol}",
+                "mark_px": float(mark_map.get(sym, 0.0)),
+                "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
+            }
+
+    await asyncio.gather(*(one(c) for c in symbols))
+    return out
+
+
+def build_rows(per_exchange: dict) -> list:
+    # собираем монеты, которые есть хотя бы на 2 биржах
+    symbols = {}
+    for ex, m in per_exchange.items():
+        for sym, rec in m.items():
+            symbols.setdefault(sym, []).append(rec)
+
+    rows = []
+    for sym, recs in symbols.items():
+        # оставляем только "живые" записи (есть валидное время следующего funding)
+        recs = [r for r in recs if (r.get("next_ms") or 0) > 0]
+        if len(recs) < 2:
+            continue
+
+        # перебираем ВСЕ пары бирж
+        for i in range(len(recs)):
+            for j in range(i + 1, len(recs)):
+                a = recs[i]
+                b = recs[j]
+
+                # classic spread между конкретной парой бирж
+                spread_classic = b["funding_pct"] - a["funding_pct"]
+
+                # timing edge для ЭТОЙ пары
+                a_mins = minutes_until(a["next_ms"])
+                b_mins = minutes_until(b["next_ms"])
+
+                # Timing YES для пары: времена начисления отличаются (значит "заберём" ближайшее начисление только на одной бирже)
+                edge = (a["next_ms"] != b["next_ms"])
+
+                # NEAREST: ближайшее начисление между ЭТИМИ ДВУМЯ
+                soon_rec = a if a["next_ms"] <= b["next_ms"] else b
+                spread_nearest = soon_rec["funding_pct"]
+
+                spread_raw = spread_nearest if edge else spread_classic
+                spread_profit = abs(spread_raw)
+
+                # фильтр минимального спреда в зависимости от Timing
+                if edge:
+                    if spread_profit < float(ui_get("min_spread_timing_yes", 0.2) or 0.2):
+                        continue
+                else:
+                    if spread_profit < float(ui_get("min_spread_timing_no", 0.35) or 0.35):
+                        continue
+
+                # --- UI volume filter (only affects UI rows) ---
+                min_vol = float(ui_get("min_vol_usdt", 0.0) or 0.0)
+                if min_vol > 0:
+                    a_vol = float(a.get("vol_usdt_24h") or 0.0)
+                    b_vol = float(b.get("vol_usdt_24h") or 0.0)
+                    if a_vol < min_vol or b_vol < min_vol:
+                        continue
+
+                # определяем min / max для UI
+                min_rec = a if a["funding_pct"] <= b["funding_pct"] else b
+                max_rec = b if min_rec is a else a
+
+                # --- price spread (mark) между LONG-side и SHORT-side ---
+                # Логика 1B: sides такие же, как подсветка в UI:
+                # Timing=NO  -> long=min_rec, short=max_rec
+                # Timing=YES -> long=та биржа, у которой next == spread_next (soon_rec), short=другая
+                long_rec = min_rec
+                short_rec = max_rec
+                if edge:
+                    if min_rec["next_ms"] == soon_rec["next_ms"]:
+                        long_rec = min_rec
+                        short_rec = max_rec
+                    elif max_rec["next_ms"] == soon_rec["next_ms"]:
+                        long_rec = max_rec
+                        short_rec = min_rec
+
+                lp = long_rec.get("mark_px")
+                sp = short_rec.get("mark_px")
+
+                price_spread_pct = None
+                try:
+                    lp = float(lp) if lp is not None else None
+                    sp = float(sp) if sp is not None else None
+                    if lp and sp and lp > 0:
+                        price_spread_pct = round((sp / lp - 1.0) * 100.0, 4)
+                except Exception:
+                    price_spread_pct = None
+                # --- UI filter: Price Δ% отдельно для "+" и "-" ---
+                neg_thr = float(ui_get("min_price_spread_neg", 0.0) or 0.0)
+
+                if price_spread_pct is not None:
+                    # "-" сторона (neg_thr хранится как модуль)
+                    if neg_thr > 0 and price_spread_pct < 0 and price_spread_pct < -neg_thr:
+                        continue
+
+                rows.append({
+                    "symbol": sym,
+
+                    "min_funding_pct": round(min_rec["funding_pct"], 4),
+                    "min_exchange": min_rec["exchange"],
+                    "min_next_msk": msk_hhmm(min_rec["next_ms"]),
+                    "min_link": min_rec["link"],
+                    "min_vol_usdt_24h": float(min_rec.get("vol_usdt_24h") or 0.0),
+
+                    "max_funding_pct": round(max_rec["funding_pct"], 4),
+                    "max_exchange": max_rec["exchange"],
+                    "max_next_msk": msk_hhmm(max_rec["next_ms"]),
+                    "max_link": max_rec["link"],
+                    "max_vol_usdt_24h": float(max_rec.get("vol_usdt_24h") or 0.0),
+
+                    "spread_pct": round(spread_profit, 4),
+                    "price_spread_pct": price_spread_pct,
+                    "spread_raw": round(spread_raw, 6),
+
+                    "spread_mode": "NEAREST" if edge else "CLASSIC",
+                    "spread_exchange": soon_rec["exchange"],
+                    "spread_next_ms": int(soon_rec["next_ms"]),
+                    "spread_next_msk": msk_hhmm(soon_rec["next_ms"]),
+
+                    "timing_edge": "YES" if edge else "NO",
+                })
+
+    # основная сортировка по спреду, вторично Timing=YES выше при равном спреде
+    rows.sort(key=lambda r: (-r["spread_pct"], r["timing_edge"] != "YES"))
+    return rows
+
+async def safe_fetch(name: str, coro):
+    try:
+        data = await coro
+        return {"ok": True, "data": data, "err": None}
+    except Exception as e:
+        return {"ok": False, "data": {}, "err": repr(e)}
+
+async def refresh_loop():
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(10.0, pool=60.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    ) as client:
+
+        while True:
+            try:
+                tasks = [
+                    safe_fetch("BINANCE", fetch_binance(client)),
+                    safe_fetch("BYBIT", fetch_bybit(client)),
+                ]
+                names = ["BINANCE", "BYBIT"]
+
+                if ENABLE_OKX:
+                    tasks.append(safe_fetch("OKX", fetch_okx(client)))
+                    names.append("OKX")
+
+                if ENABLE_GATE:
+                    tasks.append(safe_fetch("GATE", fetch_gate(client)))
+                    names.append("GATE")
+
+                if ENABLE_BITGET:
+                    tasks.append(safe_fetch("BITGET", fetch_bitget(client)))
+                    names.append("BITGET")
+
+                if ENABLE_BINGX:
+                    tasks.append(safe_fetch("BINGX", fetch_bingx(client)))
+                    names.append("BINGX")
+
+                results = await asyncio.gather(*tasks)
+
+                # берём прошлое состояние, чтобы не терять данные при ошибках
+                prev_per_exchange = STATE.get("per_exchange", {}) or {}
+                prev_ex_status = STATE.get("ex_status", {}) or {}
+
+                per_exchange = dict(prev_per_exchange)  # стартуем с прошлого снапшота
+                sources = {}
+                ex_status = dict(prev_ex_status)
+
+                now_ts = time.time()
+
+                for name, res in zip(names, results):
+                    if not isinstance(res, dict):
+                        # защита от неожиданных значений (bool / None / etc)
+                        res = {"ok": False, "data": {}, "err": f"invalid result type: {type(res)}"}
+
+                    ok = bool(res.get("ok"))
+                    data = res.get("data") or {}
+                    err = res.get("err")
+
+                    if ok and isinstance(data, dict) and len(data) > 0:
+                        # Успешно обновили биржу — записываем новые данные
+                        per_exchange[name] = data
+                        ex_status[name] = {
+                            "ok": True,
+                            "stale": False,
+                            "err": None,
+                            "updated_ts": now_ts,
+                        }
+                        sources[name] = len(data)
+                    else:
+                        # Ошибка или пустой ответ — НЕ затираем прошлые данные
+                        # Если прошлых данных нет — оставим пусто, но отметим stale
+                        prev_data = prev_per_exchange.get(name) or {}
+                        per_exchange[name] = prev_data
+
+                        ex_status[name] = {
+                            "ok": False,
+                            "stale": True,
+                            "err": err or "empty response",
+                            "updated_ts": ex_status.get(name, {}).get("updated_ts", 0.0),
+                        }
+                        sources[name] = len(prev_data)
+
+                # --- candidates: монеты, которые есть минимум на 2 биржах ---
+                symbol_to_exchanges = {}
+
+                for ex_name, ex_map in per_exchange.items():
+                    if not isinstance(ex_map, dict):
+                        continue
+
+                    for sym in ex_map.keys():
+                        if sym.endswith("USDT"):
+                            coin = sym.replace("USDT", "")
+                            symbol_to_exchanges.setdefault(coin, set()).add(ex_name)
+
+                candidates = [coin for coin, exs in symbol_to_exchanges.items() if len(exs) >= 2]
+                # сортировка candidates по "текущему спреду funding" среди уже загруженных бирж
+                def current_spread(coin: str) -> float:
+                    sym = f"{coin}USDT"
+                    rates = []
+                    for ex_map in per_exchange.values():
+                        if not isinstance(ex_map, dict):
+                            continue
+                        rec = ex_map.get(sym)
+                        if rec and ("funding_pct" in rec):
+                            rates.append(rec["funding_pct"])
+                    if len(rates) < 2:
+                        return -1e9
+                    return max(rates) - min(rates)
+
+                candidates.sort(key=current_spread, reverse=True)
+
+                # защитный лимит (теперь это НЕ рандом, а топ по спреду)
+                candidates = candidates[:300]
+
+                # --- KUCOIN (по тем же кандидатам, что и MEXC) ---
+                if ENABLE_KUCOIN:
+                    res = await safe_fetch("KUCOIN", fetch_kucoin_funding(client, candidates))
+                    if not isinstance(res, dict):
+                        res = {"ok": False, "data": {}, "err": f"invalid result type: {type(res)}"}
+
+                    ok = bool(res.get("ok"))
+                    data = res.get("data") or {}
+                    err = res.get("err")
+
+                    if ok and isinstance(data, dict) and len(data) > 0:
+                        per_exchange["KUCOIN"] = data
+                        ex_status["KUCOIN"] = {"ok": True, "stale": False, "err": None, "updated_ts": now_ts}
+                        sources["KUCOIN"] = len(data)
+                    else:
+                        prev_data = prev_per_exchange.get("KUCOIN") or {}
+                        per_exchange["KUCOIN"] = prev_data
+                        ex_status["KUCOIN"] = {
+                            "ok": False,
+                            "stale": True,
+                            "err": err or "empty response",
+                            "updated_ts": ex_status.get("KUCOIN", {}).get("updated_ts", 0.0),
+                        }
+                        sources["KUCOIN"] = len(prev_data)
+
+                coins_for_mexc = candidates
+
+                # --- MEXC ---
+                res = await safe_fetch("MEXC", fetch_mexc_funding(client, coins_for_mexc))
+                if not isinstance(res, dict):
+                    res = {"ok": False, "data": {}, "err": f"invalid result type: {type(res)}"}
+
+                ok = bool(res.get("ok"))
+                data = res.get("data") or {}
+                err = res.get("err")
+
+                if ok and isinstance(data, dict) and len(data) > 0:
+                    per_exchange["MEXC"] = data
+                    ex_status["MEXC"] = {"ok": True, "stale": False, "err": None, "updated_ts": now_ts}
+                    sources["MEXC"] = len(data)
+                else:
+                    prev_data = prev_per_exchange.get("MEXC") or {}
+                    per_exchange["MEXC"] = prev_data
+                    ex_status["MEXC"] = {
+                        "ok": False,
+                        "stale": True,
+                        "err": err or "empty response",
+                        "updated_ts": ex_status.get("MEXC", {}).get("updated_ts", 0.0),
+                    }
+                    sources["MEXC"] = len(prev_data)
+
+                rows = build_rows(per_exchange)
+
+                STATE["rows"] = rows
+                STATE["per_exchange"] = per_exchange
+                STATE["updated_ts"] = time.time()
+                STATE["error"] = None
+                STATE["sources"] = sources
+                STATE["ex_status"] = ex_status
+            except Exception as e:
+                STATE["error"] = repr(e)
+
+            await asyncio.sleep(REFRESH_SECONDS)
+
+@app.get("/api/bot/top")
+def api_bot_top(limit: int = Query(20, ge=1, le=50)):
+    """
+    Top funding rates by absolute value.
+    Используется Telegram-ботом.
+    """
+    allowed_exchanges = {"BINANCE", "BYBIT", "OKX", "GATE"}
+
+    items = []
+    per_exchange = STATE.get("per_exchange", {})
+
+    for ex_name, ex_map in per_exchange.items():
+        if ex_name not in allowed_exchanges:
+            continue
+
+        for sym, rec in ex_map.items():
+            # rec из fetch_* имеет: exchange, funding_pct, next_ms, link
+            funding = rec.get("funding_pct")
+            next_ms = rec.get("next_ms")
+            link = rec.get("link")
+
+            if funding is None or not next_ms:
+                continue
+
+            items.append({
+                "symbol": sym,
+                "funding_rate": float(funding),
+                "next_funding_ms": int(next_ms),
+                "exchange": ex_name,
+                "url": link,
+            })
+
+    items.sort(key=lambda x: abs(x["funding_rate"]), reverse=True)
+    return items[:limit]
+
+@app.get("/api/bot/all")
+def api_bot_all():
+    """
+    Full funding list for Telegram-bot (no top slicing).
+    4 exchanges only: BINANCE / BYBIT / OKX / GATE
+    """
+    allowed_exchanges = {"BINANCE", "BYBIT", "OKX", "GATE"}
+
+    items = []
+    per_exchange = STATE.get("per_exchange", {})
+
+    for ex_name, ex_map in per_exchange.items():
+        if ex_name not in allowed_exchanges:
+            continue
+
+        for sym, rec in ex_map.items():
+            funding = rec.get("funding_pct")
+            next_ms = rec.get("next_ms")
+            link = rec.get("link")
+
+            if funding is None or not next_ms:
+                continue
+
+            items.append({
+                "symbol": sym,
+                "funding_rate": float(funding),
+                "next_funding_ms": int(next_ms),
+                "exchange": ex_name,
+                "url": link,
+                "vol_usdt_24h": float(rec.get("vol_usdt_24h") or 0.0),
+            })
+
+    return items
+
+@app.on_event("startup")
+async def on_startup():
+    ui_db_init()
+    asyncio.create_task(refresh_loop())
+
+@app.get("/api/table")
+def api_table(request: Request):
+    mode = get_mode_from_request(request)
+    rows = STATE["rows"]
+
+    if mode == "near":
+        filtered = []
+        for r in rows:
+            next_ms = int(r.get("spread_next_ms") or 0)
+            if next_ms <= 0:
+                continue
+            if minutes_until(next_ms) > NEAR_MAX_MINUTES:
+                continue
+            filtered.append(r)
+
+        # сортировка: сначала по ближайшему времени, потом по спреду
+        filtered.sort(key=lambda r: (int(r["spread_next_ms"]), -r["spread_pct"]))
+        rows = filtered
+
+    return JSONResponse({
+        "updated_ts": STATE["updated_ts"],
+        "pid": os.getpid(),
+        "file": __file__,
+        "error": STATE["error"],
+        "rows": rows,
+        "sources": STATE["sources"],
+        "ex_status": STATE.get("ex_status", {}),
+        "settings": {
+            "refresh_seconds": REFRESH_SECONDS,
+            "mode": mode,
+            "near_hours": NEAR_HOURS,
+            "near_max_minutes": NEAR_MAX_MINUTES,
+            "enable_okx": ENABLE_OKX,
+            "enable_gate": ENABLE_GATE,
+            "enable_bitget": ENABLE_BITGET,
+            "enable_bingx": ENABLE_BINGX,
+            "enable_kucoin": ENABLE_KUCOIN,
+            "okx_max_symbols_per_refresh": OKX_MAX_SYMBOLS_PER_REFRESH,
+            "mexc_enabled": True,
+        }
+    })
+
+@app.get("/api/bot/debug")
+def api_bot_debug():
+    per_exchange = STATE.get("per_exchange", {})
+    return {
+        "rows_len": len(STATE.get("rows", [])),
+        "per_exchange_keys": list(per_exchange.keys()),
+        "sources": STATE.get("sources", {}),
+        "ex_status": STATE.get("ex_status", {}),
+    }
+
+@app.get("/api/admin/ui_settings")
+def api_admin_ui_settings(request: Request):
+    if not is_admin(request):
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+
+    return {
+        "ui": {
+            "min_vol_usdt": ui_get("min_vol_usdt"),
+            "min_spread_timing_yes": ui_get("min_spread_timing_yes"),
+            "min_spread_timing_no": ui_get("min_spread_timing_no"),
+            "min_price_spread_neg": ui_get("min_price_spread_neg"),
+        }
+    }
+
+@app.post("/api/admin/ui_settings")
+async def api_admin_ui_settings_set(request: Request):
+    # защита токеном
+    if not is_admin(request):
+        return JSONResponse({"detail": "forbidden"}, status_code=403)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"detail": "invalid json"}, status_code=400)
+
+    updated = {}
+
+    if "min_vol_usdt" in payload:
+        try:
+            v = float(payload["min_vol_usdt"])
+            if v < 0:
+                raise ValueError
+            ui_set("min_vol_usdt", v)
+            updated["min_vol_usdt"] = v
+        except Exception:
+            return JSONResponse({"detail": "invalid min_vol_usdt"}, status_code=400)
+
+    if "min_spread_timing_yes" in payload:
+        try:
+            v = float(payload["min_spread_timing_yes"])
+            ui_set("min_spread_timing_yes", v)
+            updated["min_spread_timing_yes"] = v
+        except Exception:
+            return JSONResponse({"detail": "invalid min_spread_timing_yes"}, status_code=400)
+
+    if "min_spread_timing_no" in payload:
+        try:
+            v = float(payload["min_spread_timing_no"])
+            ui_set("min_spread_timing_no", v)
+            updated["min_spread_timing_no"] = v
+        except Exception:
+            return JSONResponse({"detail": "invalid min_spread_timing_no"}, status_code=400)
+
+    if "min_price_spread_neg" in payload:
+        try:
+            v = float(payload["min_price_spread_neg"])
+            if v < 0:
+                raise ValueError
+            ui_set("min_price_spread_neg", v)
+            updated["min_price_spread_neg"] = v
+        except Exception:
+            return JSONResponse({"detail": "invalid min_price_spread_neg"}, status_code=400)
+
+    if not updated:
+        return JSONResponse({"detail": "nothing to update"}, status_code=400)
+    
+    # применяем настройки сразу к UI-таблице (на бота не влияет)
+    try:
+        STATE["rows"] = build_rows(STATE.get("per_exchange") or {})
+        STATE["updated_ts"] = time.time()
+    except Exception:
+        pass
+
+    return {"status": "ok", "updated": updated}
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    mode = get_mode_from_request(request)
+    token = (request.query_params.get("token") or "").strip()
+
+    html = f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Funding Spread Scanner</title>
+  <style>
+    body {{ font-family: Arial, sans-serif; padding: 16px; }}
+    h1 {{ margin: 0 0 10px 0; }}
+    .meta {{ margin: 0 0 12px 0; color: #444; }}
+    .err {{ color: #b00020; font-weight: 700; }}
+    table {{ border-collapse: collapse; width: 100%; }}
+    th, td {{ border: 1px solid #ddd; padding: 8px; font-size: 14px; }}
+    th {{ background: #f3f3f3; text-align: center; position: sticky; top: 0; }}
+    .yes {{ font-weight: 800; }}
+    .btn {{ padding:6px 12px; border:1px solid #aaa; border-radius:6px; text-decoration:none; margin-right:8px; }}
+    .active {{ background:#111; color:#fff; }}
+    .long {{ background: #e6f4ea; }}   /* светло-зеленый */
+    .short {{ background: #fce8e6; }}  /* светло-красный */
+
+  </style>
+</head>
+<body>
+  <h1>Funding Spread Scanner</h1>
+
+  <div class="meta">
+    <a href="/?mode=all{('&token=' + token) if token else ''}" class="btn {"active" if mode == "all" else ""}">ALL</a>
+    <a href="/?mode=near{('&token=' + token) if token else ''}" class="btn {"active" if mode == "near" else ""}">NEAR</a>
+  </div>
+
+  <div id="adminPanel" class="meta" style="display:none; padding:10px; border:1px solid #ddd; border-radius:8px; background:#fafafa;">
+    <b>UI фильтры (админ)</b>
+    <div style="margin-top:8px; display:flex; gap:12px; flex-wrap:wrap; align-items:flex-end;">
+      <label style="display:flex; flex-direction:column; gap:4px;">
+        Min vol (M USDT)
+        <input id="f_min_vol" type="number" min="0" step="100000" style="padding:6px; width:180px;">
+      </label>
+
+      <label style="display:flex; flex-direction:column; gap:4px;">
+        Min spread Timing=YES (%)
+        <input id="f_yes" type="number" step="0.01" style="padding:6px; width:180px;">
+      </label>
+
+      <label style="display:flex; flex-direction:column; gap:4px;">
+        Min spread Timing=NO (%)
+        <input id="f_no" type="number" step="0.01" style="padding:6px; width:180px;">
+      </label>
+      <label style="display:flex; flex-direction:column; gap:4px;">
+        Max negative Price Δ%
+        <input id="f_price_neg" type="number" step="0.01" style="padding:6px; width:180px;">
+      </label>      
+      <button id="f_save" class="btn" style="cursor:pointer;">Save</button>
+    </div>
+
+    <div id="adminMsg" style="margin-top:8px; color:#444;"></div>
+  </div>
+ 
+  <div id="status" class="meta">Загрузка…</div>
+  <div id="error" class="meta err"></div>
+
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Spread %</th>
+        <th>Min %</th>
+        <th>Min Ex</th>
+        <th>Min Funding</th>
+        <th>Max %</th>
+        <th>Max Ex</th>
+        <th>Max Funding</th>
+        <th>Price Δ%</th>
+        <th>Timing</th>
+      </tr>
+    </thead>
+    <tbody id="tbody"></tbody>
+  </table>
+
+<script>
+function getAdminToken() {{
+  const p = new URLSearchParams(window.location.search);
+  return (p.get('token') || '').trim();
+}}
+
+async function loadUiSettings(token) {{
+  const res = await fetch('/api/admin/ui_settings?token=' + encodeURIComponent(token));
+  if (!res.ok) throw new Error('GET ui_settings: ' + res.status);
+  return await res.json();
+}}
+
+async function saveUiSettings(token, payload) {{
+  const res = await fetch('/api/admin/ui_settings?token=' + encodeURIComponent(token), {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(payload),
+  }});
+  if (!res.ok) {{
+    const t = await res.text();
+    throw new Error('POST ui_settings: ' + res.status + ' ' + t);
+  }}
+  return await res.json();
+}}
+
+(function initAdminPanel() {{
+  const token = getAdminToken();
+  if (!token) return; // без token=... панель не показываем
+
+  const panel = document.getElementById('adminPanel');
+  const msg = document.getElementById('adminMsg');
+  const iVol = document.getElementById('f_min_vol');
+  const iYes = document.getElementById('f_yes');
+  const iNo  = document.getElementById('f_no');
+  const iPriceNeg = document.getElementById('f_price_neg');
+  const btn  = document.getElementById('f_save');
+
+  panel.style.display = 'block';
+  msg.textContent = 'Загрузка настроек…';
+
+  loadUiSettings(token).then((data) => {{
+    const ui = (data && data.ui) || {{}};
+    iVol.value = (ui.min_vol_usdt ?? 0) ? (Number(ui.min_vol_usdt) / 1e6) : '';
+    iYes.value = ui.min_spread_timing_yes ?? '';
+    iNo.value  = ui.min_spread_timing_no ?? '';
+    iPriceNeg.value = ui.min_price_spread_neg ?? '';
+    const vVol = Number(ui.min_vol_usdt ?? 0);
+    const vYes = Number(ui.min_spread_timing_yes ?? 0);
+    const vNo  = Number(ui.min_spread_timing_no ?? 0);
+    const vPxN = Number(ui.min_price_spread_neg ?? 0);
+
+    const parts = [];
+    if (vVol > 0) parts.push(`vol ≥ ${{(vVol/1e6).toFixed(1)}}M`);
+    if (vYes > 0) parts.push(`spread YES ≥ ${{vYes}}%`);
+    if (vNo  > 0) parts.push(`spread NO ≥ ${{vNo}}%`);
+    if (vPxN > 0) parts.push(`Price Δ%: hide if < −${{vPxN}}%`);
+
+    msg.textContent = parts.length ? ('Активные фильтры: ' + parts.join(', ')) : 'Фильтры выключены. (Таблица обновляется раз в 30 сек.)';
+  }}).catch((e) => {{
+    msg.textContent = 'Ошибка загрузки настроек: ' + e.message;
+  }});
+
+  btn.addEventListener('click', async () => {{
+    try {{
+      msg.textContent = 'Сохраняю…';
+      const payload = {{
+        min_vol_usdt: Math.round(Number(iVol.value || 0) * 1e6),
+        min_spread_timing_yes: Number(iYes.value || 0),
+        min_spread_timing_no: Number(iNo.value || 0),
+        min_price_spread_neg: Number(iPriceNeg.value || 0),
+      }};
+      await saveUiSettings(token, payload);
+      msg.textContent = 'Сохранено.';
+    }} catch (e) {{
+      msg.textContent = 'Ошибка сохранения: ' + e.message;
+    }}
+  }});
+}})();
+
+async function refresh() {{
+  const res = await fetch('/api/table?mode={mode}');
+  const data = await res.json();
+
+  const status = document.getElementById('status');
+  const error = document.getElementById('error');
+  const tbody = document.getElementById('tbody');
+
+  status.textContent = 'Обновлено: ' + (data.updated_ts ? new Date(data.updated_ts * 1000).toLocaleTimeString() : '—');
+  error.textContent = data.error ? ('Ошибка: ' + data.error) : '';
+
+  tbody.innerHTML = '';
+
+    for (const r of data.rows) {{
+      const tr = document.createElement('tr');
+      const edgeClass = (r.timing_edge === 'YES') ? 'yes' : '';
+      const coin = r.symbol.replace('USDT', '');
+
+      // классы для раскраски min/max процентов
+      let minPctClass = '';
+      let maxPctClass = '';
+
+      if (r.timing_edge === 'NO') {{
+        // Timing NO: long = Min%, short = Max%
+        minPctClass = 'long';
+        maxPctClass = 'short';
+      }} else {{
+        // Timing YES: long = ближайшее начисление, short = более позднее
+        const minIsSoon = (r.min_next_msk === r.spread_next_msk);
+        const maxIsSoon = (r.max_next_msk === r.spread_next_msk);
+
+        if (minIsSoon) {{
+          minPctClass = 'long';
+          maxPctClass = 'short';
+        }} else if (maxIsSoon) {{
+          maxPctClass = 'long';
+          minPctClass = 'short';
+        }} else {{
+          // fallback если не совпало по HH:MM
+          minPctClass = 'long';
+          maxPctClass = 'short';
+        }}
+     }}
+
+      const minVolM = (Number(r.min_vol_usdt_24h || 0) / 1e6).toFixed(1).replace('.', ',');
+      const maxVolM = (Number(r.max_vol_usdt_24h || 0) / 1e6).toFixed(1).replace('.', ',');
+      const pxSpread = (r.price_spread_pct === null || r.price_spread_pct === undefined)
+        ? '—'
+        : Number(r.price_spread_pct).toFixed(3).replace('.', ',');
+      
+
+    tr.innerHTML = `
+      <td>${{coin}}</td>
+      <td>${{r.spread_pct}}</td>
+      <td class="${{minPctClass}}">${{r.min_funding_pct}}</td>
+      <td>
+        <span style="display:inline-block; width:40px; text-align:right; font-weight:700; color:#000;">${{minVolM}}</span>
+        <span style="margin:0 6px; color:#999;">|</span>
+        <a href="${{r.min_link}}" target="_blank">${{r.min_exchange}}</a>
+      </td>
+      <td>${{r.min_next_msk}}</td>
+      <td class="${{maxPctClass}}">${{r.max_funding_pct}}</td>
+      <td>
+        <span style="display:inline-block; width:40px; text-align:right; font-weight:700; color:#000;">${{maxVolM}}</span>
+        <span style="margin:0 6px; color:#999;">|</span>
+        <a href="${{r.max_link}}" target="_blank">${{r.max_exchange}}</a>
+      </td>
+      <td>${{r.max_next_msk}}</td>
+      <td>${{pxSpread}}</td>
+      <td class="${{edgeClass}}">${{r.timing_edge}}</td>
+    `;
+    tbody.appendChild(tr);
+  }}
+}}
+
+refresh();
+setInterval(refresh, 30000);
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(html)
