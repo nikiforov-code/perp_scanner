@@ -620,9 +620,9 @@ async def any_text_handler(message: Message):
                 yp = float(data["bybit_price"])
                 lines = [
                     f"📊 {sym}",
-                    f"Binance: {bp:.2f}",
-                    f"Bybit: {yp:.2f}",
-                    f"Spread: {sp:+.5f}%",
+                    f"Binance: {bp:.5f}",
+                    f"Bybit: {yp:.5f}",
+                    f"Spread: {sp:+.3f}%",
                     "",
                 ]
                 if sp < 0:
