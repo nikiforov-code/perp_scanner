@@ -1239,6 +1239,51 @@ async def on_startup():
     ui_db_init()
     asyncio.create_task(refresh_loop())
 
+
+def _normalize_price_spread_symbol(raw: str) -> str:
+    s = (raw or "").strip().upper()
+    if not s:
+        return ""
+    if not s.endswith("USDT"):
+        s = s + "USDT"
+    return s
+
+
+@app.get("/api/bot/price_spread")
+def api_bot_price_spread(symbol: str = Query(...)):
+    sym = _normalize_price_spread_symbol(symbol)
+    if not sym:
+        return JSONResponse({"detail": "invalid symbol"}, status_code=404)
+
+    pe = STATE.get("per_exchange") or {}
+    bn_map = pe.get("BINANCE") or {}
+    by_map = pe.get("BYBIT") or {}
+    a_rec = bn_map.get(sym)
+    b_rec = by_map.get(sym)
+    if not a_rec or not b_rec:
+        return JSONResponse(
+            {"detail": "symbol not found on Binance/Bybit or no data yet"},
+            status_code=404,
+        )
+
+    try:
+        binance_price = float(a_rec["mark_px"])
+        bybit_price = float(b_rec["mark_px"])
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse({"detail": "mark_px missing"}, status_code=404)
+
+    if binance_price <= 0:
+        return JSONResponse({"detail": "invalid binance price"}, status_code=404)
+
+    spread_pct = ((bybit_price / binance_price) - 1) * 100
+    return {
+        "symbol": sym,
+        "binance_price": binance_price,
+        "bybit_price": bybit_price,
+        "spread_pct": spread_pct,
+    }
+
+
 @app.get("/api/admin/ui_settings")
 def api_admin_ui_settings(request: Request):
     if not is_admin(request):

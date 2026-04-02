@@ -366,6 +366,17 @@ async def fetch_all():
         r.raise_for_status()
         return r.json()
 
+async def fetch_price_spread(symbol: str):
+    async with httpx.AsyncClient(timeout=10) as client:
+        r = await client.get(
+            f"{API_BASE}/api/bot/price_spread",
+            params={"symbol": symbol},
+        )
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json()
+
 def passes_threshold(fr: float, pos_thr: float, neg_thr: float) -> bool:
     return fr >= pos_thr or fr <= neg_thr
 
@@ -596,6 +607,37 @@ async def any_text_handler(message: Message):
 
     # если мы не ждём ввод настроек — обычный fallback
     if not mode:
+        raw_text = (message.text or "").strip()
+        if raw_text and re.fullmatch(r"[A-Za-z0-9]{2,20}", raw_text):
+            try:
+                data = await fetch_price_spread(raw_text)
+            except Exception:
+                data = None
+            if data:
+                sp = float(data["spread_pct"])
+                sym = data["symbol"]
+                bp = float(data["binance_price"])
+                yp = float(data["bybit_price"])
+                lines = [
+                    f"📊 {sym}",
+                    f"Binance: {bp:.2f}",
+                    f"Bybit: {yp:.2f}",
+                    f"Spread: {sp:+.4f}%",
+                    "",
+                ]
+                if sp < 0:
+                    lines.append("Bybit ниже Binance")
+                elif sp > 0:
+                    lines.append("Bybit выше Binance")
+                else:
+                    lines.append("Цены равны")
+                await message.answer("\n".join(lines), reply_markup=MAIN_KB)
+                return
+            await message.answer(
+                "Монета не найдена на Binance/Bybit или по ней ещё нет данных.",
+                reply_markup=MAIN_KB,
+            )
+            return
         await message.answer("Команда не распознана. Нажми кнопку в меню 👇", reply_markup=MAIN_KB)
         return
 
