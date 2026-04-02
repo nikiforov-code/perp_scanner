@@ -622,13 +622,13 @@ async def any_text_handler(message: Message):
                     f"📊 {sym}",
                     f"Binance: {bp:.2f}",
                     f"Bybit: {yp:.2f}",
-                    f"Spread: {sp:+.4f}%",
+                    f"Spread: {sp:+.5f}%",
                     "",
                 ]
                 if sp < 0:
-                    lines.append("Bybit ниже Binance")
-                elif sp > 0:
                     lines.append("Bybit выше Binance")
+                elif sp > 0:
+                    lines.append("Bybit ниже Binance")
                 else:
                     lines.append("Цены равны")
                 await message.answer("\n".join(lines), reply_markup=MAIN_KB)

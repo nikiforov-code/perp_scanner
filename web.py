@@ -1275,7 +1275,7 @@ def api_bot_price_spread(symbol: str = Query(...)):
     if binance_price <= 0:
         return JSONResponse({"detail": "invalid binance price"}, status_code=404)
 
-    spread_pct = ((bybit_price / binance_price) - 1) * 100
+    spread_pct = ((binance_price / bybit_price) - 1) * 100
     return {
         "symbol": sym,
         "binance_price": binance_price,
