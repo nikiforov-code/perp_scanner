@@ -321,9 +321,9 @@ def format_item_line(
 
     delta_block = ""
     if ex_u in {"BYBIT", "OKX", "GATE"}:
-        delta_block = f" | Δ {delta_txt}" if delta_txt is not None else " | Δ no"
+        delta_block = f"|Δ {delta_txt}" if delta_txt is not None else " | Δ   no"
 
-    mono = f"{coin_col} {rate_col} {time_col} {vol_col}{delta_block}"
+    mono = f"{coin_col} {rate_col} {time_col}{vol_col}{delta_block}"
 
     link_label = {
         "BINANCE": "BIN",
