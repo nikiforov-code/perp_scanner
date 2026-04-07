@@ -321,7 +321,7 @@ def format_item_line(
 
     delta_block = ""
     if ex_u in {"BYBIT", "OKX", "GATE"}:
-        delta_block = f"|Δ {delta_txt}" if delta_txt is not None else f"|Δ   ХУЙ "
+        delta_block = f"|Δ {delta_txt}" if delta_txt is not None else f"|Δ  НЕТ "
 
     mono = f"{coin_col} {rate_col} {time_col}{vol_col}{delta_block}"
 
