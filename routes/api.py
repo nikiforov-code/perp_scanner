@@ -123,6 +123,7 @@ def api_bot_all():
                 "next_funding_ms": int(next_ms),
                 "exchange": ex_name,
                 "url": link,
+                "mark_px": float(rec.get("mark_px") or 0.0),
                 "vol_usdt_24h": float(rec.get("vol_usdt_24h") or 0.0),
             })
 

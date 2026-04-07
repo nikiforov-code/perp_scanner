@@ -240,14 +240,64 @@ def calc_coin_width(items: list[dict], min_w: int = 4, max_w: int = 12) -> int:
     return max(min_w, min(w, max_w))
 
 
-def format_item_line(x: dict, coin_w: int, tz: timezone = MSK) -> str:
+def _to_positive_float_or_none(v) -> Optional[float]:
+    try:
+        num = float(v)
+    except (TypeError, ValueError):
+        return None
+    return num if num > 0 else None
+
+
+def build_binance_price_map(items: list[dict]) -> Dict[str, float]:
+    out: Dict[str, float] = {}
+    for x in items:
+        ex_u = ((x.get("exchange") or "").strip().upper())
+        if ex_u != "BINANCE":
+            continue
+        sym = ((x.get("symbol") or "").strip().upper())
+        if not sym:
+            continue
+        px = _to_positive_float_or_none(x.get("mark_px"))
+        if px is None:
+            continue
+        out[sym] = px
+    return out
+
+
+def format_delta_vs_binance(
+    ex_u: str,
+    sym: str,
+    exchange_price: Optional[float],
+    binance_prices: Dict[str, float],
+) -> str:
+    if ex_u == "BINANCE":
+        return ""
+    if ex_u not in {"BYBIT", "OKX", "GATE"}:
+        return ""
+    if exchange_price is None:
+        return ""
+    binance_price = _to_positive_float_or_none(binance_prices.get(sym))
+    if binance_price is None:
+        return ""
+    delta_pct = ((binance_price / exchange_price) - 1.0) * 100.0
+    delta_txt = f"{delta_pct:+.1f}%".replace(".", ",")
+    return f" | Δ {delta_txt}"
+
+
+def format_item_line(
+    x: dict,
+    coin_w: int,
+    tz: timezone = MSK,
+    binance_prices: Optional[Dict[str, float]] = None,
+) -> str:
     sym = x.get("symbol", "")
     ex = x.get("exchange", "")
     url = x.get("url", "")
-    ex_u = (ex or "").upper()
+    ex_u = (ex or "").strip().upper()
     next_ms = int(x.get("next_funding_ms") or 0)
     fr = float(x.get("funding_rate", 0.0))
     vol = float(x.get("vol_usdt_24h") or 0.0)
+    mark_px = _to_positive_float_or_none(x.get("mark_px"))
     vol_m_txt = f"{vol/1e6:.1f}M".replace(".", ",") if vol > 0 else "--"
 
 
@@ -268,13 +318,15 @@ def format_item_line(x: dict, coin_w: int, tz: timezone = MSK) -> str:
 
     VOL_W = 7  # чтобы влезало "1560,1M"
     vol_col = (vol_m_txt[:VOL_W]).rjust(VOL_W)
+    delta_txt = format_delta_vs_binance(ex_u, (sym or "").strip().upper(), mark_px, binance_prices or {})
+    tail_mono = f"{rate_col} {time_col} {vol_col}{delta_txt}"
 
-    mono = f"{coin_col} {rate_col} {time_col} {vol_col}"
+    if url:
+        coin_html = f'<a href="{url}"><code>{coin_col}</code></a>'
+    else:
+        coin_html = f"<code>{coin_col}</code>"
 
-    ex_u = (ex or "").upper()
-    ex_short = {"BINANCE": "Bin", "BYBIT": "ByBit", "GATE": "Gate", "OKX": "OKX"}.get(ex_u, ex_u or "?")
-
-    return f'{dot} <code>{mono}</code>  <a href="{url}">{ex_short}</a>'
+    return f"{dot} {coin_html} <code>{tail_mono}</code>"
 
 
 def fmt_hhmm_msk(ms: int) -> str:
@@ -429,6 +481,7 @@ async def top_fundings(message: Message):
 
         # 1) берём много данных
         items = await fetch_all()
+        binance_prices = build_binance_price_map(items)
 
         # 2) фильтруем по порогам
         filtered = []
@@ -507,7 +560,7 @@ async def top_fundings(message: Message):
 
             lines_all.append(f"<b>{ex_title}</b>  (показано {len(arr_view)} из {len(arr)}):")
             for x in arr_view:
-                lines_all.append(format_item_line(x, coin_w, tz=user_tz))
+                lines_all.append(format_item_line(x, coin_w, tz=user_tz, binance_prices=binance_prices))
             lines_all.append("")  # пустая строка между разделами
 
         text = "\n".join(lines_all).strip()
@@ -720,6 +773,7 @@ async def notifier_loop():
             # берём полный список (нужен объём и чтобы не упускать монеты)
             try:
                 items = await fetch_all()
+                binance_prices = build_binance_price_map(items)
             except Exception as e:
                 log.exception("digest fetch_all failed: %s", e)
                 await asyncio.sleep(POLL_SECONDS)
@@ -862,7 +916,7 @@ async def notifier_loop():
                     coin_w = calc_coin_width(arr)
                     lines.append(f"<b>{ex_title}</b> (найдено {len(arr)}):")
                     for x in arr:
-                        lines.append(format_item_line(x, coin_w, tz=user_tz))
+                        lines.append(format_item_line(x, coin_w, tz=user_tz, binance_prices=binance_prices))
                     lines.append("")
 
                 text = "\n".join(lines).strip()
