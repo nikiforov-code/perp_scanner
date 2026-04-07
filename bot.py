@@ -324,7 +324,15 @@ def format_item_line(
         delta_block = f" | Δ {delta_txt}" if delta_txt is not None else " | Δ no"
 
     mono = f"{coin_col} {rate_col} {time_col} {vol_col}{delta_block}"
-    link_html = f' <a href="{url}">🔗</a>' if url else ""
+
+    link_label = {
+        "BINANCE": "BIN",
+        "BYBIT": "BB",
+        "OKX": "OKX",
+        "GATE": "GT",
+    }.get(ex_u, ex_u)
+
+    link_html = f' <a href="{url}">{link_label}</a>' if url else ""
     return f"{dot} <code>{mono}</code>{link_html}"
 
 
