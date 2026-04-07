@@ -315,7 +315,7 @@ def format_item_line(
     rate_col = (fr_txt[:RATE_W]).rjust(RATE_W)
     time_col = hhmm.ljust(TIME_W)
 
-    VOL_W = 6  # компактнее справа
+    VOL_W = 5  # компактнее справа
     vol_col = (vol_m_txt[:VOL_W]).rjust(VOL_W)
     delta_txt = format_delta_vs_binance(ex_u, (sym or "").strip().upper(), mark_px, binance_prices or {})
 
