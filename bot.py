@@ -269,19 +269,18 @@ def format_delta_vs_binance(
     sym: str,
     exchange_price: Optional[float],
     binance_prices: Dict[str, float],
-) -> str:
+) -> Optional[str]:
     if ex_u == "BINANCE":
-        return ""
+        return None
     if ex_u not in {"BYBIT", "OKX", "GATE"}:
-        return ""
+        return None
     if exchange_price is None:
-        return ""
+        return None
     binance_price = _to_positive_float_or_none(binance_prices.get(sym))
     if binance_price is None:
-        return ""
+        return None
     delta_pct = ((binance_price / exchange_price) - 1.0) * 100.0
-    delta_txt = f"{delta_pct:+.1f}%".replace(".", ",")
-    return f" | Δ {delta_txt}"
+    return f"{delta_pct:+.1f}%".replace(".", ",")
 
 
 def format_item_line(
@@ -316,17 +315,17 @@ def format_item_line(
     rate_col = (fr_txt[:RATE_W]).rjust(RATE_W)
     time_col = hhmm.ljust(TIME_W)
 
-    VOL_W = 7  # чтобы влезало "1560,1M"
+    VOL_W = 6  # компактнее справа
     vol_col = (vol_m_txt[:VOL_W]).rjust(VOL_W)
     delta_txt = format_delta_vs_binance(ex_u, (sym or "").strip().upper(), mark_px, binance_prices or {})
-    tail_mono = f"{rate_col} {time_col} {vol_col}{delta_txt}"
 
-    if url:
-        coin_html = f'<a href="{url}"><code>{coin_col}</code></a>'
-    else:
-        coin_html = f"<code>{coin_col}</code>"
+    delta_block = ""
+    if ex_u in {"BYBIT", "OKX", "GATE"}:
+        delta_block = f" | Δ {delta_txt}" if delta_txt is not None else " | Δ no"
 
-    return f"{dot} {coin_html} <code>{tail_mono}</code>"
+    mono = f"{coin_col} {rate_col} {time_col} {vol_col}{delta_block}"
+    link_html = f' <a href="{url}">🔗</a>' if url else ""
+    return f"{dot} <code>{mono}</code>{link_html}"
 
 
 def fmt_hhmm_msk(ms: int) -> str:
