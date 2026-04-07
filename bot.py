@@ -233,7 +233,7 @@ def is_clean_symbol(sym: str) -> bool:
     s = sym.upper().strip()
     return bool(LATIN_SYMBOL_RE.match(s))
 
-def calc_coin_width(items: list[dict], min_w: int = 4, max_w: int = 10) -> int:
+def calc_coin_width(items: list[dict], min_w: int = 4, max_w: int = 8) -> int:
     # ширина колонки = длина самого длинного названия монеты в текущем сообщении
     coins = [fmt_coin(x.get("symbol", "")) for x in items]
     w = max((len(c) for c in coins), default=min_w)
@@ -328,7 +328,7 @@ def format_item_line(
     link_label = {
         "BINANCE": "BIN",
         "BYBIT": "BB",
-        "OKX": "OKX",
+        "OKX": "OK",
         "GATE": "GT",
     }.get(ex_u, ex_u)
 
