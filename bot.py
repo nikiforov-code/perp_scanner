@@ -327,9 +327,9 @@ def format_item_line(
 
     link_label = {
         "BINANCE": "BIN",
-        "BYBIT": "BB",
-        "OKX": "OK",
-        "GATE": "GT",
+        "BYBIT": "B",
+        "OKX": "O",
+        "GATE": "G",
     }.get(ex_u, ex_u)
 
     link_html = f' <a href="{url}">{link_label}</a>' if url else ""
