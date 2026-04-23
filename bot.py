@@ -233,7 +233,7 @@ def is_clean_symbol(sym: str) -> bool:
     s = sym.upper().strip()
     return bool(LATIN_SYMBOL_RE.match(s))
 
-def calc_coin_width(items: list[dict], min_w: int = 4, max_w: int = 7) -> int:
+def calc_coin_width(items: list[dict], min_w: int = 4, max_w: int = 8) -> int:
     # ширина колонки = длина самого длинного названия монеты в текущем сообщении
     coins = [fmt_coin(x.get("symbol", "")) for x in items]
     w = max((len(c) for c in coins), default=min_w)
@@ -321,20 +321,20 @@ def format_item_line(
 
     delta_block = ""
     if ex_u in {"BYBIT", "OKX", "GATE"}:
-        delta_block = f"|Δ{delta_txt}" if delta_txt is not None else f"|Δ НЕТ "
+        delta_block = ""
 
     mono = f"{coin_col} {rate_col} {time_col} {vol_col}{delta_block}"
 
-    link_label = {
-        "BINANCE": "BIN",
-        "BYBIT": "B",
-        "OKX": "O",
-        "GATE": "G",
-    }.get(ex_u, ex_u)
+    if ex_u == "BINANCE":
+        link_html = f' <a href="{url}">BIN</a>' if url else ""
+        return f"{dot} <code>{mono}</code>{link_html}"
 
-    link_html = f' <a href="{url}">{link_label}</a>' if url else ""
-    return f"{dot} <code>{mono}</code>{link_html}"
+    if ex_u in {"BYBIT", "OKX", "GATE"}:
+        delta_label = f"Δ{delta_txt}" if delta_txt is not None else "ΔНЕТ"
+        delta_html = f' <a href="{url}">{delta_label}</a>' if url else f" {delta_label}"
+        return f"{dot} <code>{mono}</code>{delta_html}"
 
+    return f"{dot} <code>{mono}</code>"
 
 def fmt_hhmm_msk(ms: int) -> str:
     dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(MSK)
