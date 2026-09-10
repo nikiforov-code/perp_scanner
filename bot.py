@@ -8,7 +8,8 @@
     market.py       кэш рынка и цикл обновления
     formatting.py   форматирование строк сообщений
     digest.py       отбор монет и сборка сообщения
-    notifier.py     обход пользователей и отправка
+    notifier.py     обход пользователей и отправка дайджеста
+    radar.py        разовые оповещения о жирных отрицательных фандингах Bybit
     user_settings.py настройки пользователей и SQLite
 """
 
@@ -31,6 +32,7 @@ from formatting import build_binance_price_map, split_html_chunks
 from digest import select_items, build_message, total_count
 from market import MARKET, okx_min_volume
 from notifier import notify_users
+import radar
 
 load_dotenv()
 logging.basicConfig(
@@ -51,11 +53,16 @@ TG_MAX_LEN = 3800       # безопасный лимит длины Telegram-с
 # {user_id: UserSettings} — наполняется из базы при старте
 USER_SETTINGS: Dict[int, UserSettings] = {}
 
-# "ожидание ввода" (простая мини-FSM): user_id -> "pos" | "neg" | "digest_before" | "vol" | "tz"
+# "ожидание ввода" (мини-FSM): "pos" | "neg" | "digest_before" | "vol" | "tz"
+#                              | "radar_rate" | "radar_vol"
 WAITING_INPUT: Dict[int, str] = {}
 
 # {user_id: hour_key} — какой час уже отправлен, защита от дублей
 SENT_HOURS: Dict[int, int] = {}
+
+# {(user_id, symbol): ts} — когда радар последний раз показывал эту монету.
+# Живёт и в памяти, и в базе: иначе деплой обнулял бы тишину.
+RADAR_MARKS: Dict[tuple, int] = {}
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
@@ -119,6 +126,10 @@ def filters_kb(user_id: int) -> ReplyKeyboardMarkup:
             [
                 KeyboardButton(text=f"Дайджест за (сейчас {s.digest_before_hour_minutes} мин до часа)"),
                 KeyboardButton(text=f"Объём ≥ (сейчас {int(s.vol_threshold_usdt):,} USDT)".replace(",", " ")),
+            ],
+            [
+                KeyboardButton(text=f"📡 Радар ставка (сейчас {s.radar_rate:.2f}%)"),
+                KeyboardButton(text=f"📡 Радар объём (сейчас {s.radar_vol / 1_000_000:g}M)"),
             ],
             [
                 KeyboardButton(text=f"🕒 Таймзона (сейчас {offset_txt(s)})"),
@@ -190,7 +201,10 @@ async def me(message: Message):
         f"📉 Порог −: `{s.neg_threshold:.2f}%`\n"
         f"⏰ Дайджест за: `{s.digest_before_hour_minutes} мин`\n"
         f"💰 Объём ≥: `{s.vol_threshold_usdt / 1_000_000:.1f} млн USDT`\n"
-        f"🔔 Уведомления: `{status}`"
+        f"🔔 Уведомления: `{status}`\n\n"
+        "📡 *Радар Bybit* (разовое оповещение о жирном минусе)\n"
+        f"• ставка ниже: `{s.radar_rate:.2f}%`\n"
+        f"• объём от: `{s.radar_vol / 1_000_000:g} млн USDT`"
     )
     await message.answer(text, parse_mode="Markdown")
 
@@ -291,6 +305,31 @@ async def ask_volume_threshold(message: Message):
     await message.answer(
         "Введи минимальный объём 24h в миллионах USDT (пример: 5 = 5 000 000)\n"
         f"Сейчас: {s.vol_threshold_usdt / 1_000_000:g}M",
+        reply_markup=filters_kb(uid),
+    )
+
+
+@dp.message(lambda m: m.text and m.text.startswith("📡 Радар ставка"))
+async def ask_radar_rate(message: Message):
+    uid = message.from_user.id
+    WAITING_INPUT[uid] = "radar_rate"
+    s = get_settings(uid)
+    await message.answer(
+        "Радар ловит только отрицательные ставки и только на Bybit.\n"
+        "Введи, ниже какой ставки монета интересна (пример: 1.5 или -1.5)\n"
+        f"Сейчас: {s.radar_rate:.2f}%",
+        reply_markup=filters_kb(uid),
+    )
+
+
+@dp.message(lambda m: m.text and m.text.startswith("📡 Радар объём"))
+async def ask_radar_vol(message: Message):
+    uid = message.from_user.id
+    WAITING_INPUT[uid] = "radar_vol"
+    s = get_settings(uid)
+    await message.answer(
+        "Минимальный объём за сутки для радара, в миллионах USDT (пример: 10)\n"
+        f"Сейчас: {s.radar_vol / 1_000_000:g}M",
         reply_markup=filters_kb(uid),
     )
 
@@ -407,6 +446,32 @@ async def any_text_handler(message: Message):
             await message.answer("Готово ✅", reply_markup=filters_kb(uid))
             return
 
+        if mode == "radar_rate":
+            val = float(raw)
+            if abs(val) > 50 or val == 0:
+                raise ValueError("ставка радара должна быть от 0 до 50")
+            s.radar_rate = val
+            save_settings(uid, s)  # sanitize приведёт знак к отрицательному
+            WAITING_INPUT.pop(uid, None)
+            await message.answer(
+                f"Готово ✅ Радар ловит ставки ниже {s.radar_rate:.2f}%",
+                reply_markup=filters_kb(uid),
+            )
+            return
+
+        if mode == "radar_vol":
+            val_m = float(raw)
+            if val_m <= 0 or val_m > 100000:
+                raise ValueError("объём радара должен быть >0 (в миллионах USDT)")
+            s.radar_vol = val_m * 1_000_000
+            save_settings(uid, s)
+            WAITING_INPUT.pop(uid, None)
+            await message.answer(
+                f"Готово ✅ Радар смотрит монеты с объёмом от {s.radar_vol / 1_000_000:g}M",
+                reply_markup=filters_kb(uid),
+            )
+            return
+
         if mode == "vol":
             val_m = float(raw)
             if val_m <= 0 or val_m > 100000:
@@ -442,12 +507,26 @@ async def notifier_loop():
     while True:
         try:
             if USER_SETTINGS and MARKET.is_ready():
+                items = MARKET.items()
+                now = datetime.now(tz=timezone.utc)
+
                 await notify_users(
                     USER_SETTINGS,
-                    MARKET.items(),
-                    int(datetime.now(tz=timezone.utc).timestamp() * 1000),
+                    items,
+                    int(now.timestamp() * 1000),
                     _send_digest,
                     SENT_HOURS,
+                    is_blocked=lambda e: isinstance(e, TelegramForbiddenError),
+                    on_blocked=_disable_notifications,
+                )
+
+                await radar.radar_users(
+                    USER_SETTINGS,
+                    items,
+                    int(now.timestamp()),
+                    _send_digest,
+                    RADAR_MARKS,
+                    store.db_radar_mark,
                     is_blocked=lambda e: isinstance(e, TelegramForbiddenError),
                     on_blocked=_disable_notifications,
                 )
@@ -474,7 +553,15 @@ async def main():
     for uid, s in USER_SETTINGS.items():
         store.db_save_user(uid, s)
 
-    log.info("loaded %s users, okx min volume=%.0f", len(USER_SETTINGS), min_volume_for_okx())
+    # Отметки радара переживают рестарт, иначе деплой обнулял бы тишину
+    # и люди получали бы повторы по тем же монетам.
+    store.db_radar_purge(int(datetime.now(tz=timezone.utc).timestamp()) - radar.KEEP_MARKS_SEC)
+    RADAR_MARKS.update(store.db_radar_load_all())
+
+    log.info(
+        "loaded %s users, %s radar marks, okx min volume=%.0f",
+        len(USER_SETTINGS), len(RADAR_MARKS), min_volume_for_okx(),
+    )
 
     asyncio.create_task(MARKET.run(min_volume_for_okx))
     asyncio.create_task(notifier_loop())

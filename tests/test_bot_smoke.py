@@ -61,6 +61,25 @@ class TestBotWiring(unittest.TestCase):
         botmod.USER_SETTINGS[2] = UserSettings(vol_threshold_usdt=2_000_000)
         self.assertEqual(botmod.min_volume_for_okx(), 2_000_000)
 
+    def test_radar_buttons_present(self):
+        labels = [b.text for row in botmod.filters_kb(560).keyboard for b in row]
+        self.assertTrue(any("Радар ставка" in x for x in labels))
+        self.assertTrue(any("Радар объём" in x for x in labels))
+
+    def test_radar_defaults_shown_on_keyboard(self):
+        labels = [b.text for row in botmod.filters_kb(561).keyboard for b in row]
+        self.assertTrue(any("-1.50%" in x for x in labels))
+        self.assertTrue(any("5M" in x for x in labels))
+
+    def test_radar_rate_sign_fixed_on_save(self):
+        s = botmod.get_settings(562)
+        s.radar_rate = 2.5          # пользователь ввёл без минуса
+        botmod.save_settings(562, s)
+        self.assertEqual(store.db_load_user(562).radar_rate, -2.5)
+
+    def test_radar_marks_dict_exists(self):
+        self.assertIsInstance(botmod.RADAR_MARKS, dict)
+
     def test_offset_txt_formats_sign(self):
         self.assertEqual(botmod.offset_txt(UserSettings(utc_offset_hours=3)), "UTC +3")
         self.assertEqual(botmod.offset_txt(UserSettings(utc_offset_hours=-5)), "UTC -5")
