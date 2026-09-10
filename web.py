@@ -31,7 +31,7 @@ app.include_router(api_router)
 
 # OKX (добавляем аккуратно, чтобы было стабильно)
 ENABLE_OKX = True
-OKX_MAX_SYMBOLS_PER_REFRESH = 350  # лимит, чтобы не упереться в ограничения OKX
+OKX_MAX_SYMBOLS_PER_REFRESH = 0  # не используется: отбор монет OKX идёт по объёму
 
 # Gate.io
 ENABLE_GATE = True
@@ -52,6 +52,16 @@ from admin.ui_settings_store import ui_db_init, ui_get, ui_set
 
 from state import STATE
 
+# Качалки четырёх бирж вынесены в общий пакет — их же использует бот.
+from exchanges import binance as ex_binance
+from exchanges import bybit as ex_bybit
+from exchanges import gate as ex_gate
+from exchanges import okx as ex_okx
+from exchanges.types import to_percent, to_int_ms, okx_instid_to_symbol
+
+# Сканер опрашивает фандинги OKX поштучно, поэтому берём только ликвидные монеты.
+OKX_MIN_VOL_USDT = 1_000_000
+
 def msk_hhmm(ms: int) -> str:
     dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone(MSK)
     return dt.strftime("%H:%M")
@@ -60,35 +70,6 @@ def minutes_until(ms: int) -> int:
     now = int(time.time() * 1000)
     return max(0, int((ms - now) / 60000))
 
-def to_percent(rate_str: str) -> float:
-    # rate_str обычно в долях (пример 0.0001). Переводим в %
-    return float(rate_str) * 100.0
-
-def to_int_ms(v) -> int:
-    try:
-        if v is None:
-            return 0
-        s = str(v).strip()
-        if not s:
-            return 0
-        return int(float(s))
-    except Exception:
-        return 0
-
-
-def make_binance_link(symbol: str) -> str:
-    return f"https://www.binance.com/en/futures/{symbol}"
-
-def make_bybit_link(symbol: str) -> str:
-    return f"https://www.bybit.com/trade/usdt/{symbol}"
-
-def make_okx_link(inst_id: str) -> str:
-    # OKX использует формат типа BTC-USDT-SWAP
-    return f"https://www.okx.com/trade-swap/{inst_id}"
-
-def make_gate_link(contract: str) -> str:
-    # пример: BTC_USDT -> страница фьючерса Gate
-    return f"https://www.gate.com/futures/USDT/{contract}"
 
 def make_bitget_link(symbol: str) -> str:
     return f"https://www.bitget.com/futures/usdt/{symbol}"
@@ -111,355 +92,6 @@ def get_mode_from_request(request: Request) -> str:
     if mode in ("all", "near"):
         return mode
     return "near"
-
-def okx_instid_to_symbol(inst_id: str) -> str:
-    # BTC-USDT-SWAP -> BTCUSDT
-    parts = inst_id.split("-")
-    if len(parts) >= 2 and parts[1] == "USDT":
-        return f"{parts[0]}USDT"
-    return ""
-
-async def fetch_binance(client: httpx.AsyncClient) -> dict:
-    """
-    Binance USD-M Futures:
-    1) exchangeInfo -> whitelist реально торгуемых PERPETUAL (status=TRADING)
-    2) premiumIndex -> funding + nextFundingTime
-    """
-    base = "https://fapi.binance.com"
-
-    # 1) whitelist TRADING символов
-    info_url = f"{base}/fapi/v1/exchangeInfo"
-    r1 = await client.get(info_url, timeout=10)
-    r1.raise_for_status()
-    info = r1.json()
-
-    tradable = set()
-    for s in (info.get("symbols") or []):
-        sym = s.get("symbol")
-        if not sym or not sym.endswith("USDT"):
-            continue
-        if s.get("contractType") != "PERPETUAL":
-            continue
-        if s.get("status") != "TRADING":
-            continue
-        tradable.add(sym)
-
-    # 2) funding из premiumIndex
-    prem_url = f"{base}/fapi/v1/premiumIndex"
-    r2 = await client.get(prem_url, timeout=10)
-    r2.raise_for_status()
-    data = r2.json()
-
-    # 3) 24h объёмы (quoteVolume) — для USDT-пар это объём в USDT
-    vol_url = f"{base}/fapi/v1/ticker/24hr"
-    r3 = await client.get(vol_url, timeout=10)
-    r3.raise_for_status()
-    vol_data = r3.json()
-
-    vol_map = {}
-    for v in vol_data:
-        sym = v.get("symbol")
-        if not sym or sym not in tradable:
-            continue
-        qv = v.get("quoteVolume")
-        try:
-            vol_map[sym] = float(qv)
-        except Exception:
-            continue
-
-    out = {}
-    for item in data:
-        sym = item.get("symbol")
-        if not sym or sym not in tradable:
-            continue
-
-        out[sym] = {
-            "exchange": "BINANCE",
-            "funding_pct": to_percent(item["lastFundingRate"]),
-            "next_ms": int(item["nextFundingTime"]),
-            "mark_px": float(item.get("markPrice") or 0.0),            
-            "link": make_binance_link(sym),
-            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
-        }
-    return out
-
-async def fetch_bybit(client: httpx.AsyncClient) -> dict:
-    """
-    Bybit V5: GET /v5/market/tickers?category=linear
-    поля: fundingRate, nextFundingTime, turnover24h
-    """
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear"}
-
-    r = await client.get(url, params=params, timeout=10)
-    r.raise_for_status()
-    js = r.json()
-
-    items = (js.get("result", {}) or {}).get("list", []) or []
-
-    # Составляем карту объёмов из ТОГО ЖЕ ответа (turnover24h)
-    vol_map = {}
-    for it in items:
-        sym = (it.get("symbol") or "").strip()
-        if not sym:
-            continue
-        t24 = it.get("turnover24h")
-        if t24 is None:
-            continue
-        try:
-            vol_map[sym] = float(t24)
-        except Exception:
-            continue
-
-    out = {}
-    for item in items:
-        sym = (item.get("symbol") or "").strip()
-        if not sym or not sym.endswith("USDT"):
-            continue
-
-        fr = item.get("fundingRate")
-        nft = item.get("nextFundingTime")
-
-        if fr is None or nft is None:
-            continue
-
-        out[sym] = {
-            "exchange": "BYBIT",
-            "funding_pct": to_percent(fr),
-            "next_ms": int(nft),
-            "mark_px": float(item.get("markPrice") or 0.0),
-            "link": make_bybit_link(sym),
-            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
-        }
-
-    return out
-
-async def fetch_okx(client: httpx.AsyncClient) -> dict:
-    """
-    OKX:
-    1) берём список SWAP инструментов: GET /api/v5/public/instruments?instType=SWAP
-    2) по каждому instId берём funding: GET /api/v5/public/funding-rate?instId=...
-    """
-    # 1) список инструментов
-    inst_url = "https://www.okx.com/api/v5/public/instruments"
-    r = await client.get(inst_url, params={"instType": "SWAP"}, timeout=10)
-    r.raise_for_status()
-    js = r.json()
-    data = js.get("data", []) or []
-
-    inst_ids = []
-    for it in data:
-        inst_id = it.get("instId", "")
-        # берём только USDT-SWAP
-        if inst_id.endswith("-USDT-SWAP"):
-            inst_ids.append(inst_id)
-
-    # лимитируем, чтобы было стабильно
-    inst_ids = inst_ids[:OKX_MAX_SYMBOLS_PER_REFRESH]
-    # --- OKX 24h volumes (SWAP, USDT) ---
-    vol_map = {}
-
-    tick_url = "https://www.okx.com/api/v5/market/tickers"
-    r_tick = await client.get(tick_url, params={"instType": "SWAP"}, timeout=10)
-    r_tick.raise_for_status()
-    tick_js = r_tick.json()
-
-    for t in (tick_js.get("data") or []):
-        inst_id = t.get("instId", "")
-        if not inst_id.endswith("-USDT-SWAP"):
-            continue
-
-        sym = okx_instid_to_symbol(inst_id)
-        if not sym:
-            continue
-
-        v = t.get("volCcy24h")
-        px = t.get("last")
-        try:
-            vol_map[sym] = float(v) * float(px)
-        except Exception:
-            continue
-    # --- OKX mark prices (SWAP) ---
-    mark_map = {}
-    try:
-        mp_url = "https://www.okx.com/api/v5/public/mark-price"
-        r_mp = await client.get(mp_url, params={"instType": "SWAP"}, timeout=10)
-        r_mp.raise_for_status()
-        mp_js = r_mp.json()
-
-        for t in (mp_js.get("data") or []):
-            inst_id = t.get("instId", "")
-            if not inst_id.endswith("-USDT-SWAP"):
-                continue
-
-            sym = okx_instid_to_symbol(inst_id)
-            if not sym:
-                continue
-
-            mp = t.get("markPx")
-            if mp is None:
-                continue
-
-            try:
-                mark_map[sym] = float(mp)
-            except Exception:
-                continue
-    except Exception:
-        mark_map = {}
-    out = {}
-
-    async def one(inst_id: str):
-        url = "https://www.okx.com/api/v5/public/funding-rate"
-        rr = await client.get(url, params={"instId": inst_id}, timeout=10)
-        rr.raise_for_status()
-        jj = rr.json()
-        d = (jj.get("data", []) or [])
-        if not d:
-            return
-        rec = d[0]
-        funding_rate = rec.get("fundingRate")
-        next_ft = rec.get("nextFundingTime")  # обычно есть
-        ft = rec.get("fundingTime")           # на всякий случай
-
-        if funding_rate is None:
-            return
-
-        ft_ms = to_int_ms(ft)
-        next_ft_ms = to_int_ms(next_ft)
-
-        now_ms = int(datetime.now(tz=timezone.utc).timestamp() * 1000)
-        cands = [t for t in (ft_ms, next_ft_ms) if t and t >= now_ms]
-        next_ms = min(cands) if cands else (next_ft_ms or ft_ms)
-
-
-        sym = okx_instid_to_symbol(inst_id)
-        if not sym:
-            return
-
-        out[sym] = {
-            "exchange": "OKX",
-            "funding_pct": to_percent(funding_rate),
-            "next_ms": next_ms,
-            "link": make_okx_link(inst_id),
-
-            "okx_fundingTime_ms": ft_ms,
-            "okx_nextFundingTime_ms": next_ft_ms,
-
-            "mark_px": float(mark_map.get(sym, 0.0)),
-            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
-        }
-
-    # параллельно, но аккуратно (batch)
-    sem = asyncio.Semaphore(12)
-    async def guarded(inst_id: str):
-        async with sem:
-            await one(inst_id)
-
-    await asyncio.gather(*(guarded(i) for i in inst_ids))
-    return out
-
-GATE_ACTIVE_CONTRACTS_TTL = 3 * 60 * 60  # 3 часа
-_gate_active_contracts_cache = {
-    "ts": 0,
-    "symbols": set(),
-}
-async def get_gate_active_contracts(client: httpx.AsyncClient) -> set[str]:
-    now = time.time()
-    if now - _gate_active_contracts_cache["ts"] < GATE_ACTIVE_CONTRACTS_TTL:
-        return _gate_active_contracts_cache["symbols"]
-
-    url = "https://api.gateio.ws/api/v4/futures/usdt/contracts"
-    r = await client.get(url)
-    r.raise_for_status()
-    data = r.json()
-
-    active = set()
-    for c in data:
-        # active + perpetual + USDT
-        if (
-            c.get("in_delisting") is False
-            and c.get("name", "").endswith("_USDT")
-        ):
-            active.add(c["name"].replace("_USDT", ""))
-
-    _gate_active_contracts_cache["ts"] = now
-    _gate_active_contracts_cache["symbols"] = active
-    return active
-
-async def fetch_gate(client: httpx.AsyncClient) -> dict:
-    active_contracts = await get_gate_active_contracts(client)
-    # Gate.io Futures (USDT settle):
-    # GET /api/v4/futures/usdt/contracts
-    # поля: funding_rate (string, доля), funding_next_apply (unix seconds)
-    url = "https://fx-api.gateio.ws/api/v4/futures/usdt/contracts"
-    r = await client.get(url, timeout=10)
-    r.raise_for_status()
-    data = r.json()
-    # 24h объёмы Gate берём из /futures/usdt/tickers
-    tick_url = "https://fx-api.gateio.ws/api/v4/futures/usdt/tickers"
-    r_tick = await client.get(tick_url, timeout=10)
-    r_tick.raise_for_status()
-    tickers = r_tick.json()
-
-    vol_map = {}
-    mark_map = {}
-    for t in tickers:
-        name = t.get("contract")  # пример: BTC_USDT
-        if not name or not name.endswith("_USDT"):
-            continue
-
-        coin = name.replace("_USDT", "")
-        sym = f"{coin}USDT"
-        # --- mark price для Price Δ% ---
-        mp = t.get("mark_price")
-        if mp is None:
-            mp = t.get("markPrice")
-        if mp is None:
-            mp = t.get("mark")
-        if mp is None:
-            mp = t.get("last")  # fallback, если mark нет (лучше чем ничего)
-
-        if mp is not None:
-            try:
-                mark_map[sym] = float(mp)
-            except Exception:
-                pass
-        qv = t.get("volume_24h_quote")
-        if qv is None:
-            continue
-        try:
-            vol_map[sym] = float(qv)
-        except Exception:
-            continue  
-
-    out = {}
-    for item in data:
-        name = item.get("name")  # пример: BTC_USDT
-        if not name or not name.endswith("_USDT"):
-            continue
-
-        fr = item.get("funding_rate")
-        nft = item.get("funding_next_apply")  # unix seconds
-        if fr is None or nft is None:
-            continue
-
-        coin = name.replace("_USDT", "")
-
-        if coin not in active_contracts:
-            continue
-
-        sym = f"{coin}USDT"
-
-        out[sym] = {
-            "exchange": "GATE",
-            "funding_pct": to_percent(fr),
-            "next_ms": int(nft) * 1000,
-            "link": make_gate_link(name),
-            "mark_px": float(mark_map.get(sym, 0.0)),
-            "vol_usdt_24h": float(vol_map.get(sym, 0.0)),
-        }
-
-    return out
 
 # --- BITGET contracts cache ---
 _BITGET_CONTRACTS_CACHE = {"ts": 0.0, "set": set()}
@@ -1072,17 +704,17 @@ async def refresh_loop():
         while True:
             try:
                 tasks = [
-                    safe_fetch("BINANCE", fetch_binance(client)),
-                    safe_fetch("BYBIT", fetch_bybit(client)),
+                    safe_fetch("BINANCE", ex_binance.fetch(client)),
+                    safe_fetch("BYBIT", ex_bybit.fetch(client)),
                 ]
                 names = ["BINANCE", "BYBIT"]
 
                 if ENABLE_OKX:
-                    tasks.append(safe_fetch("OKX", fetch_okx(client)))
+                    tasks.append(safe_fetch("OKX", ex_okx.fetch(client, OKX_MIN_VOL_USDT)))
                     names.append("OKX")
 
                 if ENABLE_GATE:
-                    tasks.append(safe_fetch("GATE", fetch_gate(client)))
+                    tasks.append(safe_fetch("GATE", ex_gate.fetch(client)))
                     names.append("GATE")
 
                 if ENABLE_BITGET:
