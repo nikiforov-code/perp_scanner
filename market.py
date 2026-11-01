@@ -28,6 +28,10 @@ BOT_EXCHANGES = ("BINANCE", "BYBIT", "OKX", "GATE")
 FAST_PERIOD_SEC = 60
 OKX_FUNDING_PERIOD_SEC = 180
 
+# Данные биржи старше этого в выдачу не попадают. Раньше при падении биржи бот
+# неделями мог показывать её последний снимок как свежий — и дайджест, и радар.
+STALE_AFTER_SEC = 10 * 60
+
 # нижняя граница отбора монет OKX: защищает от пользователя, поставившего порог в ноль
 OKX_MIN_VOL_FLOOR = 500_000
 
@@ -51,13 +55,17 @@ class Market:
 
     # ---------- состояние ----------
 
-    def merge(self, name: str, data: dict, err: Optional[str] = None) -> None:
-        """Кладёт свежие данные биржи. Сбой не затирает прошлый снимок."""
+    def merge(self, name: str, data: dict, err: Optional[str] = None, data_ts: Optional[float] = None) -> None:
+        """Кладёт свежие данные биржи. Сбой не затирает прошлый снимок.
+
+        data_ts — когда данные реально получены, если не сейчас: у OKX цены свежие,
+        а фандинги могли остаться от прошлого удачного прохода.
+        """
         now = time.time()
 
         if not err and isinstance(data, dict) and data:
             self.per_exchange[name] = data
-            self.status[name] = {"ok": True, "stale": False, "err": None, "updated_ts": now}
+            self.status[name] = {"ok": True, "stale": False, "err": None, "updated_ts": data_ts or now}
         else:
             prev = self.per_exchange.get(name) or {}
             self.per_exchange[name] = prev
@@ -70,11 +78,19 @@ class Market:
 
         self.updated_ts = now
 
-    def items(self) -> list:
+    def fresh(self, name: str, now: Optional[float] = None) -> dict:
+        """Данные биржи, если они не старше STALE_AFTER_SEC, иначе пусто."""
+        now = time.time() if now is None else now
+        updated_ts = (self.status.get(name) or {}).get("updated_ts", 0.0)
+        if now - updated_ts > STALE_AFTER_SEC:
+            return {}
+        return self.per_exchange.get(name) or {}
+
+    def items(self, now: Optional[float] = None) -> list:
         """Плоский список в том же виде, в каком его раньше отдавал /api/bot/all."""
         out = []
         for ex_name in BOT_EXCHANGES:
-            for sym, rec in (self.per_exchange.get(ex_name) or {}).items():
+            for sym, rec in self.fresh(ex_name, now).items():
                 funding = rec.get("funding_pct")
                 next_ms = rec.get("next_ms")
                 if funding is None or not next_ms:
@@ -98,8 +114,8 @@ class Market:
         if not sym.endswith("USDT"):
             sym += "USDT"
 
-        a_rec = (self.per_exchange.get("BINANCE") or {}).get(sym)
-        b_rec = (self.per_exchange.get("BYBIT") or {}).get(sym)
+        a_rec = self.fresh("BINANCE").get(sym)
+        b_rec = self.fresh("BYBIT").get(sym)
         if not a_rec or not b_rec:
             return None
 
@@ -127,8 +143,8 @@ class Market:
         }
 
     def is_ready(self) -> bool:
-        """Есть ли хоть какие-то данные — чтобы не слать пустые ответы на старте."""
-        return any((self.per_exchange.get(ex) or {}) for ex in BOT_EXCHANGES)
+        """Есть ли хоть какие-то свежие данные — чтобы не слать пустые ответы."""
+        return any(self.fresh(ex) for ex in BOT_EXCHANGES)
 
     # ---------- обновление ----------
 
@@ -185,7 +201,7 @@ class Market:
     def _recompose_okx(self) -> None:
         if not self._okx_funding:
             return
-        self.merge("OKX", ex_okx.compose(self._okx_prices, self._okx_funding))
+        self.merge("OKX", ex_okx.compose(self._okx_prices, self._okx_funding), data_ts=self._okx_last_ts)
 
     async def run(self, min_vol_provider) -> None:
         """Вечный цикл обновления. min_vol_provider() отдаёт порог объёма для OKX."""

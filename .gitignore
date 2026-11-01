@@ -1,4 +1,3 @@
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.pyc
@@ -7,6 +6,7 @@ __pycache__/
 
 # Virtual environment
 .venv/
+venv/
 
 # Environment variables
 .env
@@ -17,4 +17,4 @@ __pycache__/
 
 # Databases
 *.db
-EOF
+*.db.bak-*

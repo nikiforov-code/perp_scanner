@@ -21,7 +21,7 @@ from datetime import datetime, timezone, timedelta
 from typing import Dict
 
 from aiogram import Bot, Dispatcher
-from aiogram.exceptions import TelegramForbiddenError
+from aiogram.exceptions import TelegramForbiddenError, TelegramRetryAfter
 from aiogram.filters import Command
 from aiogram.types import Message, ReplyKeyboardMarkup, KeyboardButton
 from dotenv import load_dotenv
@@ -49,6 +49,8 @@ if not TOKEN:
 
 POLL_SECONDS = 25       # как часто проверяем, кому пора слать дайджест
 TG_MAX_LEN = 3800       # безопасный лимит длины Telegram-сообщения
+SEND_ATTEMPTS = 3       # сколько раз пробуем отправить при флуд-контроле
+MAX_RETRY_WAIT_SEC = 30 # дольше не ждём: рассылка встала бы для всех остальных
 
 # {user_id: UserSettings} — наполняется из базы при старте
 USER_SETTINGS: Dict[int, UserSettings] = {}
@@ -147,6 +149,23 @@ def filters_kb(user_id: int) -> ReplyKeyboardMarkup:
 # ОТПРАВКА
 # =========================
 
+async def send_message_retrying(**kwargs):
+    """send_message, переживающий флуд-контроль Telegram (429).
+
+    Радар шлёт по сообщению на монету, и на резком движении рынка Telegram
+    отвечает «Retry in N seconds». Раньше это считалось сбоем: у дайджеста первая
+    часть уже ушла, и через 25 с он отправлялся целиком заново — с дублем.
+    """
+    for attempt in range(SEND_ATTEMPTS):
+        try:
+            return await bot.send_message(**kwargs)
+        except TelegramRetryAfter as e:
+            if attempt == SEND_ATTEMPTS - 1 or e.retry_after > MAX_RETRY_WAIT_SEC:
+                raise
+            log.warning("flood control chat=%s, жду %s с", kwargs.get("chat_id"), e.retry_after)
+            await asyncio.sleep(e.retry_after)
+
+
 async def send_chunks(chat_id: int, text: str, reply_markup=None) -> None:
     """Шлёт длинный HTML-текст частями, не ломая разметку.
 
@@ -155,7 +174,7 @@ async def send_chunks(chat_id: int, text: str, reply_markup=None) -> None:
     """
     chunks = split_html_chunks(text, TG_MAX_LEN)
     for i, chunk in enumerate(chunks):
-        await bot.send_message(
+        await send_message_retrying(
             chat_id=chat_id,
             text=chunk,
             parse_mode="HTML",
@@ -217,7 +236,7 @@ async def top_fundings(message: Message):
     try:
         if not MARKET.is_ready():
             await message.answer(
-                "Данные ещё загружаются, попробуй через минуту.",
+                "Нет свежих данных с бирж, попробуй через минуту.",
                 reply_markup=MAIN_KB,
             )
             return

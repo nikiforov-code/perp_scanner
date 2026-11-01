@@ -1,3 +1,4 @@
+import importlib.util
 import os
 import sys
 import tempfile
@@ -145,6 +146,17 @@ class TestStore(unittest.TestCase):
     def test_load_user_sanitizes(self):
         us.db_save_user(8, UserSettings(neg_threshold=2.0))
         self.assertEqual(us.db_load_user(8).neg_threshold, -2.0)
+
+
+class TestDbPath(unittest.TestCase):
+    def test_db_path_does_not_depend_on_cwd(self):
+        """С другим WorkingDirectory служба создала бы пустую базу рядом."""
+        # свежая копия модуля: остальные тесты подменяют DB_PATH на временный файл
+        spec = importlib.util.spec_from_file_location("us_fresh", us.__file__)
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        self.assertTrue(os.path.isabs(fresh.DB_PATH))
+        self.assertEqual(os.path.dirname(fresh.DB_PATH), os.path.dirname(os.path.abspath(us.__file__)))
 
 
 if __name__ == "__main__":
