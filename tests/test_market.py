@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from market import Market
+from market import Market, STALE_AFTER_SEC
 
 
 def rec(exchange, funding=0.1, next_ms=1789041600000, mark=100.0, vol=5_000_000.0):
@@ -71,6 +71,45 @@ class TestItems(unittest.TestCase):
     def test_items_skip_records_without_next_funding(self):
         self.m.merge("GATE", {"BTCUSDT": rec("GATE", next_ms=0)})
         self.assertEqual(len([i for i in self.m.items() if i["exchange"] == "GATE"]), 0)
+
+
+class TestStale(unittest.TestCase):
+    def setUp(self):
+        self.m = Market()
+        self.m.merge("BINANCE", {"BTCUSDT": rec("BINANCE")})
+        self.m.merge("BYBIT", {"BTCUSDT": rec("BYBIT")})
+        self.now = self.m.status["BINANCE"]["updated_ts"]
+
+    def _age(self, name, sec):
+        self.m.status[name]["updated_ts"] = self.now - sec
+
+    def test_fresh_exchange_is_returned(self):
+        self.assertEqual(len(self.m.items(now=self.now)), 2)
+
+    def test_stale_exchange_is_dropped(self):
+        """Лежащая биржа не должна выдавать свой последний снимок за свежий."""
+        self._age("BYBIT", STALE_AFTER_SEC + 1)
+        got = self.m.items(now=self.now)
+        self.assertEqual([i["exchange"] for i in got], ["BINANCE"])
+
+    def test_failed_fetch_becomes_stale_after_timeout(self):
+        self.m.merge("BYBIT", {}, err="ConnectTimeout")
+        self.assertEqual(len(self.m.items(now=self.now)), 2)
+        self.assertEqual(len(self.m.items(now=self.now + STALE_AFTER_SEC + 1)), 0)
+
+    def test_data_ts_overrides_merge_time(self):
+        """У OKX цены свежие, а фандинги могут быть старыми — возраст считаем по фандингам."""
+        self.m.merge("OKX", {"BTCUSDT": rec("OKX")}, data_ts=self.now - STALE_AFTER_SEC - 1)
+        self.assertEqual(self.m.fresh("OKX", now=self.now), {})
+
+    def test_not_ready_when_everything_stale(self):
+        self._age("BINANCE", STALE_AFTER_SEC + 1)
+        self._age("BYBIT", STALE_AFTER_SEC + 1)
+        self.assertFalse(self.m.is_ready())
+
+    def test_price_spread_ignores_stale_exchange(self):
+        self._age("BYBIT", STALE_AFTER_SEC + 1)
+        self.assertIsNone(self.m.price_spread("BTC"))
 
 
 class TestPriceSpread(unittest.TestCase):

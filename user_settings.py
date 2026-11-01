@@ -1,11 +1,14 @@
 """Персональные настройки пользователей бота и их хранение в SQLite."""
 
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, Optional
 
-DB_PATH = "bot_settings.db"
+# Путь от папки проекта, а не от текущей директории: с другим WorkingDirectory
+# у службы бот молча создал бы пустую базу и «забыл» всех пользователей.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bot_settings.db")
 SQLITE_TIMEOUT_SEC = 5.0  # сколько ждать, если база занята
 
 DEFAULT_UTC_OFFSET = 3  # решение владельца: пользователям без таймзоны ставим UTC+3

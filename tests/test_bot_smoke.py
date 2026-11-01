@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import unittest
+from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -83,6 +84,48 @@ class TestBotWiring(unittest.TestCase):
     def test_offset_txt_formats_sign(self):
         self.assertEqual(botmod.offset_txt(UserSettings(utc_offset_hours=3)), "UTC +3")
         self.assertEqual(botmod.offset_txt(UserSettings(utc_offset_hours=-5)), "UTC -5")
+
+
+def _flood(retry_after):
+    from aiogram.exceptions import TelegramRetryAfter
+    from aiogram.methods import SendMessage
+    return TelegramRetryAfter(
+        method=SendMessage(chat_id=1, text="x"), message="Too Many Requests", retry_after=retry_after
+    )
+
+
+class TestFloodControl(unittest.IsolatedAsyncioTestCase):
+    async def test_retries_after_flood_control(self):
+        send = AsyncMock(side_effect=[_flood(3), "ok"])
+        sleep = AsyncMock()
+        with patch.object(botmod.bot, "send_message", send), patch("bot.asyncio.sleep", sleep):
+            await botmod.send_message_retrying(chat_id=1, text="x")
+        self.assertEqual(send.await_count, 2)
+        sleep.assert_awaited_once_with(3)
+
+    async def test_digest_chunk_not_duplicated(self):
+        """Раньше 429 на второй части заставлял слать весь дайджест заново."""
+        send = AsyncMock(side_effect=["ok", _flood(1), "ok"])
+        text = "\n".join(["x" * 100] * 60)  # заведомо больше одной части
+        with patch.object(botmod.bot, "send_message", send), patch("bot.asyncio.sleep", AsyncMock()):
+            await botmod.send_chunks(1, text)
+        sent = [c.kwargs["text"] for c in send.await_args_list]
+        self.assertEqual(len(sent), 3)
+        self.assertEqual(sent[1], sent[2])  # повторена только упавшая часть
+
+    async def test_gives_up_on_long_wait(self):
+        send = AsyncMock(side_effect=[_flood(botmod.MAX_RETRY_WAIT_SEC + 1)])
+        with patch.object(botmod.bot, "send_message", send), patch("bot.asyncio.sleep", AsyncMock()):
+            with self.assertRaises(Exception):
+                await botmod.send_message_retrying(chat_id=1, text="x")
+        self.assertEqual(send.await_count, 1)
+
+    async def test_gives_up_after_attempts(self):
+        send = AsyncMock(side_effect=[_flood(1)] * botmod.SEND_ATTEMPTS)
+        with patch.object(botmod.bot, "send_message", send), patch("bot.asyncio.sleep", AsyncMock()):
+            with self.assertRaises(Exception):
+                await botmod.send_message_retrying(chat_id=1, text="x")
+        self.assertEqual(send.await_count, botmod.SEND_ATTEMPTS)
 
 
 class TestTickerQuery(unittest.IsolatedAsyncioTestCase):
